@@ -13,10 +13,16 @@ Tested on: Xiaomi Book Pro 14 (Core Ultra X7 358H, Arc B390, 3120x2080 eDP).
 ```bash
 cargo build --release
 
-./target/release/wayland-bench            # window, press Start
-./target/release/wayland-bench --check    # can this session be measured?
-./target/release/wayland-bench --run --json
+./target/release/wayland-compositor-bench                 # window, press Start
+./target/release/wayland-compositor-bench --check         # can this session be measured?
+./target/release/wayland-compositor-bench --run --json
 ```
+
+The `blur:` chip next to Start reports whether the compositor advertises
+`ext-background-effect-v1` and doubles as a switch: click it to drop the
+translucent, blurred window background for a plain opaque one. Blur is a real
+cost for the compositor, so the switch makes runs comparable between
+compositors that blur and ones that do not.
 
 `--run` measures immediately and **exits when done**, so it can sit in a script.
 The JSON lands in `results/<label>-<timestamp>.json`; the label defaults to the
@@ -29,10 +35,10 @@ the difference between identical runs is usually bigger than the one you are
 chasing.
 
 ```bash
-./target/release/wayland-bench --report              # medians of results/*.json
-./target/release/wayland-bench --report ~/runs/labwc # a directory, files, or labels
-./target/release/wayland-bench --compare labwc gnome # side by side, with a noise floor
-./target/release/wayland-bench --compare labwc gnome ~/runs # …reading a directory
+./target/release/wayland-compositor-bench --report              # medians of results/*.json
+./target/release/wayland-compositor-bench --report ~/runs/labwc # a directory, files, or labels
+./target/release/wayland-compositor-bench --compare labwc gnome # side by side, with a noise floor
+./target/release/wayland-compositor-bench --compare labwc gnome ~/runs # …reading a directory
 ```
 
 Flags: `--idle S` (20), `--frames S` per frame test (6), `--windows N` (6),
@@ -48,7 +54,7 @@ sudo pacman -U wayland-compositor-bench-*.pkg.tar.zst     # Arch
 sudo apt install ./wayland-compositor-bench_*_amd64.deb   # Debian / Ubuntu
 ```
 
-Both packages install `/usr/bin/wayland-bench`. The Debian package is built on
+Both packages install `/usr/bin/wayland-compositor-bench`. The Debian package is built on
 Debian 13 (GTK 4.18) so the dependency floor is honest; the Arch package is
 built by `PKGBUILD` in the repository root.
 

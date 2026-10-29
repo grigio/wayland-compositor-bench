@@ -10,7 +10,7 @@
 # directory.
 
 pkgname=wayland-compositor-bench
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Measure the Wayland session you are logged into: memory, cost per frame, idle power"
 arch=('x86_64')
@@ -41,7 +41,7 @@ check() {
 
 package() {
   cd "$startdir"
-  install -Dm755 target/release/wayland-bench "$pkgdir/usr/bin/wayland-bench"
+  install -Dm755 target/release/wayland-compositor-bench "$pkgdir/usr/bin/wayland-compositor-bench"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"

@@ -415,32 +415,44 @@ pub struct GpuInfo {
     pub driver: String,
     pub pci_id: String,
     pub pci_slot: String,
+    /// The rest of the machine's GPUs, as "name · driver".
+    pub others: Vec<String>,
 }
 
-/// Human name for a PCI id from `/usr/share/hwdata/pci.ids`, when present.
+/// Human name for a PCI id from the pci.ids database. Distros disagree on
+/// where it lives: hwdata on Arch/Fedora, misc on Debian, pciutils elsewhere.
 /// Falls back to the bare id: a wrong name is worse than none.
 fn pci_name(id: &str) -> Option<String> {
     let (vendor, device) = id.split_once(':')?;
-    let text = std::fs::read_to_string("/usr/share/hwdata/pci.ids").ok()?;
-    let mut in_vendor = false;
-    for line in text.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
+    for path in [
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/usr/share/pci.ids",
+        "/var/lib/pciutils/pci.ids",
+    ] {
+        let Ok(text) = fs::read_to_string(path) else {
             continue;
-        }
-        if !line.starts_with('\t') {
-            let Some(v) = line.split_whitespace().next() else {
+        };
+        let mut in_vendor = false;
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
                 continue;
-            };
-            in_vendor = v.eq_ignore_ascii_case(vendor);
-            continue;
-        }
-        if in_vendor && !line.starts_with("\t\t") {
-            let mut it = line.trim_start().splitn(2, char::is_whitespace);
-            let Some(dev) = it.next() else { continue };
-            if dev.eq_ignore_ascii_case(device) {
-                let name = it.next().unwrap_or("").trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
+            }
+            if !line.starts_with('\t') {
+                let Some(v) = line.split_whitespace().next() else {
+                    continue;
+                };
+                in_vendor = v.eq_ignore_ascii_case(vendor);
+                continue;
+            }
+            if in_vendor && !line.starts_with("\t\t") {
+                let mut it = line.trim_start().splitn(2, char::is_whitespace);
+                let Some(dev) = it.next() else { continue };
+                if dev.eq_ignore_ascii_case(device) {
+                    let name = it.next().unwrap_or("").trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
                 }
             }
         }
@@ -448,35 +460,218 @@ fn pci_name(id: &str) -> Option<String> {
     None
 }
 
-pub fn gpu_info() -> GpuInfo {
-    let uevent = read("/sys/class/drm/card0/device/uevent").unwrap_or_default();
-    let mut map = HashMap::new();
-    for line in uevent.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            map.insert(k.to_string(), v.to_string());
+fn pci_vendor_name(id: &str) -> Option<&'static str> {
+    Some(match id.split(':').next()?.to_ascii_lowercase().as_str() {
+        "1002" => "AMD",
+        "8086" => "Intel",
+        "10de" => "NVIDIA",
+        "13b5" => "ARM",
+        "5143" => "Qualcomm",
+        "1af4" => "virtio",
+        "1414" => "Microsoft",
+        "1ae0" => "Google",
+        _ => return None,
+    })
+}
+
+/// One `/sys/class/drm/cardN`, with what the kernel exposes about it.
+#[derive(Clone, Debug, Default)]
+struct Card {
+    node: String,
+    driver: String,
+    pci_id: String,
+    slot: String,
+    drm_name: String,
+    boot_vga: bool,
+    connected: usize,
+    /// The compositor has this device open (card or render node).
+    used: bool,
+}
+
+/// DRM devices the given process holds open. A compositor usually opens the
+/// render node, not the card node, so both map back to the same `device`.
+fn drm_devices_used(pid: u32) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let Ok(target) = fs::read_link(e.path()) else {
+            continue;
+        };
+        let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("card") || name.starts_with("renderD")) {
+            continue;
+        }
+        if let Ok(dev) = fs::canonicalize(format!("/sys/class/drm/{name}/device")) {
+            if !out.contains(&dev) {
+                out.push(dev);
+            }
         }
     }
-    let driver = map.get("DRIVER").cloned().unwrap_or_default();
-    let id = map.get("PCI_ID").cloned().unwrap_or_default();
-    let slot = map.get("PCI_SLOT_NAME").cloned().unwrap_or_default();
-    // Prefer the name the kernel gives us; the PCI id is what identifies the
-    // part across machines.
-    let name = map
-        .get("DRM_NAME")
-        .cloned()
-        .filter(|n| !n.is_empty() && n != "unknown")
-        .unwrap_or_else(|| {
-            if id.is_empty() {
-                "unknown GPU".into()
-            } else {
-                pci_name(&id).unwrap_or_else(|| format!("GPU {id}"))
+    out
+}
+
+fn drm_cards(compositor: Option<u32>) -> Vec<Card> {
+    let used = compositor.map(drm_devices_used).unwrap_or_default();
+    let Ok(rd) = fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut cards = Vec::new();
+    for e in rd.flatten() {
+        let node = e.file_name().to_string_lossy().to_string();
+        let Some(num) = node.strip_prefix("card") else {
+            continue;
+        };
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let dev = e.path().join("device");
+        let uevent = read(&dev.join("uevent").to_string_lossy()).unwrap_or_default();
+        let mut map = HashMap::new();
+        for line in uevent.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.to_string(), v.to_string());
             }
+        }
+        // The uevent is the fastest source, but platform GPUs often omit the
+        // driver there: the symlink the driver core creates is authoritative.
+        let driver = map
+            .get("DRIVER")
+            .cloned()
+            .filter(|d| !d.is_empty())
+            .or_else(|| {
+                fs::read_link(dev.join("driver"))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            })
+            .unwrap_or_default();
+        let pci_id = map
+            .get("PCI_ID")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let vendor = read(&dev.join("vendor").to_string_lossy())?;
+                let device = read(&dev.join("device").to_string_lossy())?;
+                Some(format!(
+                    "{}:{}",
+                    vendor.trim().trim_start_matches("0x").to_ascii_lowercase(),
+                    device.trim().trim_start_matches("0x").to_ascii_lowercase()
+                ))
+            })
+            .unwrap_or_default();
+        let slot = map
+            .get("PCI_SLOT_NAME")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                fs::canonicalize(&dev)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            })
+            .unwrap_or_default();
+        let connected = fs::read_dir("/sys/class/drm")
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|o| {
+                        let name = o.file_name().to_string_lossy().to_string();
+                        name.starts_with(&format!("{node}-"))
+                            && read(&o.path().join("status").to_string_lossy()).as_deref()
+                                == Some("connected")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        cards.push(Card {
+            node,
+            driver,
+            pci_id,
+            slot,
+            drm_name: map.get("DRM_NAME").cloned().unwrap_or_default(),
+            boot_vga: proc::read_u64(&dev.join("boot_vga").to_string_lossy()) == Some(1),
+            connected,
+            used: fs::canonicalize(&dev)
+                .map(|p| used.contains(&p))
+                .unwrap_or(false),
         });
+    }
+    cards
+}
+
+impl Card {
+    /// Which card a benchmark run is about: the one the compositor renders
+    /// with, then the boot display, then whichever has a monitor attached. A
+    /// virtual or unbound device only wins when it is the only one there.
+    fn rank(&self) -> i32 {
+        let virtual_driver = matches!(
+            self.driver.as_str(),
+            "" | "vgem" | "vkms" | "simpledrm" | "simpledrmfb"
+        );
+        let mut score = 0;
+        if self.used {
+            score += 100;
+        }
+        if !virtual_driver {
+            score += 20;
+        }
+        if self.boot_vga {
+            score += 10;
+        }
+        if self.connected > 0 {
+            score += 5;
+        }
+        if !self.pci_id.is_empty() {
+            score += 2;
+        }
+        score
+    }
+
+    fn name(&self) -> String {
+        if let Some(n) = pci_name(&self.pci_id) {
+            return n;
+        }
+        if !self.drm_name.is_empty() && self.drm_name != "unknown" {
+            return self.drm_name.clone();
+        }
+        if self.pci_id.is_empty() {
+            if !self.driver.is_empty() {
+                return format!("{} GPU", self.driver);
+            }
+            return "unknown GPU".into();
+        }
+        match pci_vendor_name(&self.pci_id) {
+            Some(vendor) => format!("{vendor} GPU {}", self.pci_id),
+            None => format!("GPU {}", self.pci_id),
+        }
+    }
+
+    fn describe(&self) -> String {
+        if self.driver.is_empty() {
+            self.name()
+        } else {
+            format!("{} · {}", self.name(), self.driver)
+        }
+    }
+}
+
+pub fn gpu_info(compositor: Option<u32>) -> GpuInfo {
+    let mut cards = drm_cards(compositor);
+    // Stable order for equal ranks: card0 first, then card1, …
+    cards.sort_by(|a, b| b.rank().cmp(&a.rank()).then_with(|| a.node.cmp(&b.node)));
+    let Some(primary) = cards.first() else {
+        return GpuInfo {
+            name: "unknown GPU".into(),
+            ..Default::default()
+        };
+    };
     GpuInfo {
-        name,
-        driver,
-        pci_id: id,
-        pci_slot: slot,
+        name: primary.name(),
+        driver: primary.driver.clone(),
+        pci_id: primary.pci_id.clone(),
+        pci_slot: primary.slot.clone(),
+        others: cards[1..].iter().map(Card::describe).collect(),
     }
 }
 
@@ -553,9 +748,9 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn collect(hint: DisplayHint, compositor: Option<&str>) -> Self {
+    pub fn collect(hint: DisplayHint, compositor: Option<&proc::Compositor>) -> Self {
         let (cores, threads) = cpu_topology();
-        let gpu = gpu_info();
+        let gpu = gpu_info(compositor.map(|c| c.pid));
         Self {
             cpu: cpu_model(),
             cpu_cores: cores,
@@ -574,7 +769,7 @@ impl Env {
             temp_c: package_temp_c(),
             cpu_ghz: cpu_current_ghz(),
             throttled: throttled(),
-            config_hash: compositor.and_then(proc::config_hash),
+            config_hash: compositor.and_then(|c| proc::config_hash(&c.name)),
         }
     }
 
@@ -631,5 +826,48 @@ mod tests {
         assert!(a.display_delta(&b).is_some());
         b.display.refresh_hz = Some(120.0);
         assert!(a.display_delta(&b).is_none());
+    }
+
+    #[test]
+    fn the_card_the_compositor_uses_wins() {
+        let fallback = Card {
+            node: "card0".into(),
+            driver: "simpledrm".into(),
+            ..Default::default()
+        };
+        let amd = Card {
+            node: "card1".into(),
+            driver: "amdgpu".into(),
+            pci_id: "1002:15d8".into(),
+            used: true,
+            ..Default::default()
+        };
+        assert!(amd.rank() > fallback.rank());
+        // a real driver beats a virtual one even without an attached monitor
+        let real = Card {
+            node: "card2".into(),
+            driver: "i915".into(),
+            ..Default::default()
+        };
+        assert!(real.rank() > fallback.rank());
+    }
+
+    #[test]
+    fn gpu_names_fall_back_to_the_vendor() {
+        let amd = Card {
+            pci_id: "1002:ffff".into(),
+            ..Default::default()
+        };
+        assert_eq!(amd.name(), "AMD GPU 1002:ffff");
+        let unknown = Card {
+            pci_id: "ffff:ffff".into(),
+            ..Default::default()
+        };
+        assert_eq!(unknown.name(), "GPU ffff:ffff");
+        let platform = Card {
+            driver: "msm".into(),
+            ..Default::default()
+        };
+        assert_eq!(platform.name(), "msm GPU");
     }
 }

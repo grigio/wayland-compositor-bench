@@ -427,7 +427,7 @@ fn load(targets: &[PathBuf]) -> Result<(Labeled, usize), String> {
     let files = collect(targets);
     if files.is_empty() {
         return Err(
-            "no results/*.json yet — run `wayland-bench --run --json` inside each session first"
+            "no results/*.json yet — run `wayland-compositor-bench --run --json` inside each session first"
                 .into(),
         );
     }

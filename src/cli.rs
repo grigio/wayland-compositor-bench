@@ -3,15 +3,15 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-wayland-bench — measure the Wayland session you are logged into
+wayland-compositor-bench — measure the Wayland session you are logged into
 
 USAGE:
-    wayland-bench                          open the window, press Start
-    wayland-bench --run [--json [FILE]]    start measuring as soon as it is up
-    wayland-bench --report [PATH…]         print medians of results/*.json
-    wayland-bench --compare A B [PATH…]    two labels side by side, with noise floor
-    wayland-bench --check                  can this session be measured reliably?
-    wayland-bench --help
+    wayland-compositor-bench                        open the window, press Start
+    wayland-compositor-bench --run [--json [FILE]]  start measuring as soon as it is up
+    wayland-compositor-bench --report [PATH…]       print medians of results/*.json
+    wayland-compositor-bench --compare A B [PATH…]  two labels side by side, with noise floor
+    wayland-compositor-bench --check                can this session be measured reliably?
+    wayland-compositor-bench --help
 
 OPTIONS:
     --run               run the benchmark ~1 s after the window appears

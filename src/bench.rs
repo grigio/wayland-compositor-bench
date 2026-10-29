@@ -553,7 +553,7 @@ async fn run(ui: BenchUi) {
         scale: ui.scale,
         compositor_hz: Some(ui.refresh_hz),
     };
-    let env = sysinfo::Env::collect(hint, comp.as_ref().map(|c| c.name.as_str()));
+    let env = sysinfo::Env::collect(hint, comp.as_ref());
 
     let mut checks = vec![
         report::Check {

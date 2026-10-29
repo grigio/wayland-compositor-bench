@@ -4,6 +4,32 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-29
+
+### Changed
+
+- The binary is now called `wayland-compositor-bench` (it was `wayland-bench`);
+  both packages install `/usr/bin/wayland-compositor-bench`.
+
+### Added
+
+- The `blur:` chip next to Start is now a switch: clicking it drops the
+  translucent, compositor-blurred window background for a plain opaque one, so
+  a run can be measured with and without the blur the compositor pays for.
+- GPU detection walks every `/sys/class/drm/card*` instead of assuming
+  `card0`, follows the compositor's open card/render node, and reads the driver
+  from the driver symlink when the uevent omits it. This finds AMD integrated
+  GPUs and other platform devices that used to show as `unknown GPU`; extra
+  GPUs are listed in the GPU tooltip.
+- `pci.ids` is looked up in the hwdata, misc and pciutils locations, so names
+  resolve on Debian as well as Arch.
+
+### Removed
+
+- The C capability probe (`src/blur.c`, `build.rs`, the vendored protocol XML)
+  is now Rust: `wayland-client` + `wayland-protocols` enumerate the registry and
+  read the blur capabilities on a dedicated connection.
+
 ## [0.3.0] — 2026-10-29
 
 ### Fixed

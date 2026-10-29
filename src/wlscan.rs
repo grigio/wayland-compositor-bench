@@ -9,9 +9,12 @@
 //! the same as `wp_presentation` turns the number into a vanity metric, and
 //! wlroots-only protocols are a design choice, not a missing feature.
 
-use std::ffi::c_void;
-
-use gtk::prelude::*;
+use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::protocol::wl_registry;
+use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::{
+    self, ExtBackgroundEffectManagerV1,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BlurState {
@@ -32,6 +35,15 @@ impl BlurState {
             BlurState::Error => "probe failed",
         }
     }
+
+    /// What fits in the header chip.
+    pub fn short(self) -> &'static str {
+        match self {
+            BlurState::Active => "active",
+            BlurState::Unsupported => "not supported",
+            BlurState::Error => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,44 +58,90 @@ pub struct Scan {
     pub blur: BlurState,
 }
 
-extern "C" {
-    fn wbg_scan(display: *mut c_void, out: *mut u8, outlen: i32) -> i32;
-    fn gdk_wayland_display_get_wl_display(display: *mut c_void) -> *mut c_void;
+/// Registry state for the probe: only the blur capabilities are interesting.
+#[derive(Default)]
+struct Probe {
+    caps: Option<u32>,
 }
 
-pub fn scan(window: &gtk::Window) -> Scan {
-    let display = <gtk::Window as gtk::prelude::WidgetExt>::display(window);
-    let mut buf = vec![0u8; 32 * 1024];
-    let rc = unsafe {
-        let dpy = gdk_wayland_display_get_wl_display(display.as_ptr() as *mut c_void);
-        wbg_scan(dpy, buf.as_mut_ptr(), buf.len() as i32)
-    };
-    let text = String::from_utf8_lossy(&buf)
-        .split('\0')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    Scan {
-        globals: text
-            .lines()
-            .filter_map(|l| {
-                let mut it = l.split('\t');
-                let name = it.next()?.trim();
-                if name.is_empty() {
-                    return None;
-                }
-                Some(Global {
-                    name: name.to_string(),
-                    version: it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(1),
-                })
-            })
-            .collect(),
-        blur: match rc {
-            1 => BlurState::Active,
-            0 => BlurState::Unsupported,
-            _ => BlurState::Error,
-        },
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Probe {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
+}
+
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Probe {
+    fn event(
+        state: &mut Self,
+        _: &ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_background_effect_manager_v1::Event::Capabilities {
+            flags: WEnum::Value(caps),
+        } = event
+        {
+            state.caps = Some(caps.bits());
+        }
+    }
+}
+
+/// Enumerates the globals of the compositor behind `WAYLAND_DISPLAY` and asks
+/// whether ext-background-effect-v1 offers blur.
+///
+/// A dedicated connection is used instead of GDK's: the probe needs a
+/// roundtrip, and dispatching GTK's queue from here would steal events that
+/// GTK owns. It binds the manager but never creates a
+/// `ext_background_effect_surface_v1` — GTK already owns one per toplevel and a
+/// second one is a protocol error that kills the connection.
+pub fn scan() -> Scan {
+    let mut out = Scan::default();
+    let Ok(conn) = Connection::connect_to_env() else {
+        return out;
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<Probe>(&conn) else {
+        return out;
+    };
+    out.globals = globals
+        .contents()
+        .clone_list()
+        .into_iter()
+        .map(|g| Global {
+            name: g.interface,
+            version: g.version,
+        })
+        .collect();
+
+    let Ok(manager) =
+        globals.bind::<ExtBackgroundEffectManagerV1, _, _>(&queue.handle(), 1..=1, ())
+    else {
+        // the global is absent (or only an older version): nothing to ask
+        out.blur = BlurState::Unsupported;
+        return out;
+    };
+
+    let mut probe = Probe::default();
+    // the capabilities event is sent when the global is bound
+    out.blur = if queue.roundtrip(&mut probe).is_ok() {
+        match probe.caps {
+            Some(caps) if caps & 1 != 0 => BlurState::Active,
+            Some(_) => BlurState::Unsupported,
+            None => BlurState::Error,
+        }
+    } else {
+        BlurState::Error
+    };
+    manager.destroy();
+    let _ = conn.flush();
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

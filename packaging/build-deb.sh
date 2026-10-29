@@ -20,7 +20,7 @@ cd "$root"
 version=${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)}
 [ -n "$version" ] || { echo "build-deb: cannot read version from Cargo.toml" >&2; exit 1; }
 pkg=wayland-compositor-bench
-bin=wayland-bench
+bin=wayland-compositor-bench
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 

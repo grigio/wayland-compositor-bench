@@ -64,6 +64,21 @@ window.wbg, window.wbg.background { background-color: transparent; }
 }
 .chip.ok   { background-color: rgba(74,222,128,0.16); color: #86efac; }
 .chip.warn { background-color: rgba(251,191,36,0.16); color: #fcd34d; }
+button.chip {
+    background-image: none; border: none; box-shadow: none;
+    min-height: 0; min-width: 0;
+}
+button.chip:hover { background-color: rgba(255,255,255,0.18); }
+button.chip.ok:hover { background-color: rgba(74,222,128,0.26); }
+button.chip.warn:hover { background-color: rgba(251,191,36,0.26); }
+/* Blur off: the window paints its own opaque background, so nothing of the
+   desktop shows through and the compositor has nothing to blur. */
+window.wbg.solid, window.wbg.solid.background {
+    background-color: #12141c; border-radius: 18px;
+}
+window.wbg.solid .card {
+    background-color: #12141c; backdrop-filter: none;
+}
 button.start {
     background-image: none; background-color: #4f8cff; color: #ffffff;
     border-radius: 10px; padding: 7px 20px; font-weight: 600;
@@ -234,6 +249,33 @@ fn set_performance_tip(labels: &Labels, tip: &str) {
     if let Some(l) = labels.get("Performance mode") {
         l.set_tooltip_text(Some(tip));
     }
+}
+
+/// The header chip reports what the compositor advertises, and doubles as the
+/// switch between the translucent, compositor-blurred background and a plain
+/// opaque one.
+fn set_blur_chip(chip: &gtk::Button, state: wlscan::BlurState, off: bool) {
+    chip.remove_css_class("ok");
+    chip.remove_css_class("warn");
+    if off {
+        chip.set_label("blur: off");
+        chip.add_css_class("warn");
+        chip.set_tooltip_text(Some(
+            "Compositor blur and window transparency are off — click to use the blurred background",
+        ));
+        return;
+    }
+    chip.set_label(&format!("blur: {}", state.short()));
+    chip.add_css_class(match state {
+        wlscan::BlurState::Active => "ok",
+        _ => "warn",
+    });
+    chip.set_tooltip_text(Some(match state {
+        wlscan::BlurState::Active => {
+            "Blur is active — click to disable it and use a normal window background"
+        }
+        _ => "No compositor blur — click to switch between transparent and solid background",
+    }));
 }
 
 #[derive(Clone)]
@@ -440,10 +482,10 @@ fn check() -> glib::ExitCode {
         compositor_hz: None,
         ..Default::default()
     };
-    let env = sysinfo::Env::collect(hint, comp.as_ref().map(|c| c.name.as_str()));
+    let env = sysinfo::Env::collect(hint, comp.as_ref());
     let mut warn: Vec<String> = Vec::new();
 
-    println!("wayland-bench check\n");
+    println!("wayland-compositor-bench check\n");
 
     let desktop = proc::desktop(comp.as_ref());
     println!("session");
@@ -593,7 +635,7 @@ fn check() -> glib::ExitCode {
         20, 45, 6
     );
     println!("  opens 6 extra toplevels for the memory and multi-surface phases");
-    println!("  protocol scan: needs a mapped window, so it runs in the GUI only");
+    println!("  protocol scan: runs once the window is up, on its own Wayland connection");
 
     // Heavy neighbours are the most common reason two runs of the same
     // compositor disagree, so they surface before spending two minutes.
@@ -647,7 +689,7 @@ fn main() -> glib::ExitCode {
     let opts = match cli::Options::parse(std::env::args().skip(1)) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("wayland-bench: {e}\n\n{}", cli::USAGE);
+            eprintln!("wayland-compositor-bench: {e}\n\n{}", cli::USAGE);
             return glib::ExitCode::FAILURE;
         }
     };
@@ -656,14 +698,14 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
     if opts.version {
-        println!("wayland-bench {}", env!("CARGO_PKG_VERSION"));
+        println!("wayland-compositor-bench {}", env!("CARGO_PKG_VERSION"));
         return glib::ExitCode::SUCCESS;
     }
     if opts.report {
         return match report::print(&opts.files) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("wayland-bench: {e}");
+                eprintln!("wayland-compositor-bench: {e}");
                 glib::ExitCode::FAILURE
             }
         };
@@ -672,7 +714,7 @@ fn main() -> glib::ExitCode {
         return match report::compare(a, b, &opts.files) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("wayland-bench: {e}");
+                eprintln!("wayland-compositor-bench: {e}");
                 glib::ExitCode::FAILURE
             }
         };
@@ -701,7 +743,7 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| build_ui(app, opts.clone()));
     // We already consumed our own flags; hand GApplication a clean argv so it
     // does not reject --run/--json/--windows.
-    app.run_with_args(&["wayland-bench"])
+    app.run_with_args(&["wayland-compositor-bench"])
 }
 
 fn build_ui(app: &gtk::Application, opts: cli::Options) {
@@ -740,8 +782,10 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     titles.append(&title);
     titles.append(&subtitle);
 
-    let blur_chip = gtk::Label::new(Some("blur: …"));
+    let blur_chip = gtk::Button::with_label("blur: …");
     blur_chip.add_css_class("chip");
+    blur_chip.set_valign(gtk::Align::Center);
+    blur_chip.set_tooltip_text(Some("Checking the compositor's blur support"));
     let close = gtk::Button::with_label("✕");
     close.add_css_class("ghost");
     close.set_valign(gtk::Align::Center);
@@ -931,6 +975,26 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
 
     // ------------------------------------------------------------- wiring --
     let scan_cell: Rc<RefCell<Option<wlscan::Scan>>> = Rc::new(RefCell::new(None));
+    let blur_state = Rc::new(Cell::new(wlscan::BlurState::Error));
+    let blur_off = Rc::new(Cell::new(false));
+    // Clicking the chip makes the window opaque: the CSS class drops the
+    // backdrop-filter, so GTK stops asking the compositor to blur behind it.
+    {
+        let w = window.clone();
+        let chip = blur_chip.clone();
+        let off = blur_off.clone();
+        let state = blur_state.clone();
+        blur_chip.connect_clicked(move |_| {
+            let now = !off.get();
+            off.set(now);
+            if now {
+                w.add_css_class("solid");
+            } else {
+                w.remove_css_class("solid");
+            }
+            set_blur_chip(&chip, state.get(), now);
+        });
+    }
     let comp = proc::compositor();
     let comp_pid = comp.as_ref().map(|c| c.pid);
     let monitor = gtk::gdk::Display::default()
@@ -1006,7 +1070,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     }
 
     // static hardware info
-    let gpu = sysinfo::gpu_info();
+    let gpu = sysinfo::gpu_info(comp_pid);
     set(&labels, "CPU", &cpu_model_clean());
     set(&labels, "CPU cores", &cpu_detail());
     set(&labels, "GPU", &gpu.name);
@@ -1020,6 +1084,11 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
             (false, false) => format!("{} · {}", gpu.driver, gpu.pci_id),
         },
     );
+    if let Some(l) = labels.get("GPU") {
+        if !gpu.others.is_empty() {
+            l.set_tooltip_text(Some(&format!("other GPUs: {}", gpu.others.join(", "))));
+        }
+    }
     if let Some(l) = labels.get("GPU driver") {
         if !gpu.pci_slot.is_empty() {
             l.set_tooltip_text(Some(&format!("PCI {}", gpu.pci_slot)));
@@ -1219,20 +1288,19 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     window.set_child(Some(&overlay));
     window.present();
 
-    // the scan needs a mapped window; run it on the next main-loop iteration
+    // run the probe after the window is up, so its roundtrip does not delay
+    // the first frame
     {
-        let w = window.clone();
         let chip = blur_chip.clone();
         let blur_label = labels.get("Blur protocol").cloned();
         let cell = scan_cell.clone();
         let sui = summary_ui.clone();
+        let state = blur_state.clone();
+        let off = blur_off.clone();
         glib::timeout_add_local_once(Duration::from_millis(150), move || {
-            let scan = wlscan::scan(w.upcast_ref());
-            chip.set_text(&format!("blur: {}", scan.blur.label()));
-            chip.add_css_class(match scan.blur {
-                wlscan::BlurState::Active => "ok",
-                _ => "warn",
-            });
+            let scan = wlscan::scan();
+            state.set(scan.blur);
+            set_blur_chip(&chip, scan.blur, off.get());
             if let Some(l) = blur_label {
                 l.set_text(&format!(
                     "{} · {} globals advertised",
