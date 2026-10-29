@@ -1,5 +1,7 @@
 # wayland-compositor-bench
 
+[![CI](https://github.com/grigio/wayland-compositor-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/grigio/wayland-compositor-bench/actions/workflows/ci.yml)
+
 Measure the Wayland session you are logged into: how much memory and CPU the
 compositor costs at rest, what it costs per presented frame, and how much power
 the machine draws while it sits there. One Rust binary, no scripts, no Python.
