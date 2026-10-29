@@ -1,0 +1,24 @@
+[package]
+name = "wayland-compositor-bench"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.92"
+description = "GTK4 Wayland compositor benchmark: session footprint, frame pacing and idle power"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "wayland-bench"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11.5" }
+glib = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 2
+strip = true

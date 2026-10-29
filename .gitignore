@@ -1,0 +1,7 @@
+/target
+/results/*.json
+/dist
+/.cargo-home
+/pkg
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
