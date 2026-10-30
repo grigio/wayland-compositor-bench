@@ -10,13 +10,13 @@
 # directory.
 
 pkgname=wayland-compositor-bench
-pkgver=0.3.1
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Measure the Wayland session you are logged into: memory, cost per frame, idle power"
 arch=('x86_64')
 url="https://github.com/grigio/wayland-compositor-bench"
 license=('GPL-3.0-only')
-depends=('gtk4' 'wayland')
+depends=('gtk4' 'wayland' 'desktop-file-utils' 'gtk-update-icon-cache' 'hicolor-icon-theme')
 makedepends=('cargo' 'pkgconf')
 source=()
 sha256sums=()
@@ -45,4 +45,8 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+  install -Dm644 packaging/wayland-compositor-bench.desktop \
+    "$pkgdir/usr/share/applications/wayland-compositor-bench.desktop"
+  install -Dm644 packaging/wayland-compositor-bench.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/wayland-compositor-bench.svg"
 }

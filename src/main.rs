@@ -409,11 +409,12 @@ impl SummaryUi {
             .map(|g| format!(" · {g:.3} ms GPU"))
             .unwrap_or_default();
         self.comp.set_text(&format!(
-            "RAM {} → {} peak · CPU {} → {} peak · compositor {:.0} MiB PSS · {:.3} ms CPU/frame{} · confidence {}",
+            "RAM {} → {} peak · CPU {} → {} peak · {:.1}% other CPU · compositor {:.0} MiB PSS · {:.3} ms CPU/frame{} · confidence {}",
             sysinfo::fmt_mib(s.ram_mib),
             sysinfo::fmt_mib(s.ram_peak_mib),
             sysinfo::fmt_pct(s.cpu_pct),
             sysinfo::fmt_pct(s.cpu_peak_pct),
+            s.other_cpu_pct,
             s.comp_mib,
             s.comp_ms_per_frame,
             gpu,
@@ -496,7 +497,7 @@ impl SummaryUi {
 /// `--check`: can this session be measured, and what would the report be
 /// missing? Every line is something the JSON records, so a bad run is visible
 /// before spending two minutes on it.
-fn check() -> glib::ExitCode {
+fn check(opts: &cli::Options) -> glib::ExitCode {
     let comp = proc::compositor();
     let hint = sysinfo::DisplayHint {
         compositor_hz: None,
@@ -657,9 +658,12 @@ fn check() -> glib::ExitCode {
     println!("\nwhat a run would do");
     println!(
         "  idle {} s after up to {} s of settling, then two {} s frame tests",
-        20, 45, 6
+        opts.idle_s, opts.settle_s, opts.frames_s
     );
-    println!("  opens 6 extra toplevels for the memory and multi-surface phases");
+    println!(
+        "  opens {} extra toplevels for the memory and multi-surface phases",
+        opts.windows
+    );
     println!("  protocol scan: runs once the window is up, on its own Wayland connection");
 
     // Heavy neighbours are the most common reason two runs of the same
@@ -691,12 +695,14 @@ fn check() -> glib::ExitCode {
         println!("\nverdict: measurable — expect high confidence\n");
         glib::ExitCode::SUCCESS
     } else {
-        println!("\nverdict: measurable with caveats");
+        // Exit 2, not 1: "measurable with caveats" is a usable session, but a
+        // script that needs a clean one can still gate on the status.
+        println!("\nverdict: measurable with caveats (exit 2)");
         for w in &warn {
             println!("  ! {w}");
         }
         println!();
-        glib::ExitCode::SUCCESS
+        glib::ExitCode::from(2u8)
     }
 }
 
@@ -745,7 +751,7 @@ fn main() -> glib::ExitCode {
         };
     }
     if opts.check {
-        return check();
+        return check(&opts);
     }
 
     let app = gtk::Application::builder()
@@ -765,13 +771,22 @@ fn main() -> glib::ExitCode {
         }
     });
 
-    app.connect_activate(move |app| build_ui(app, opts.clone()));
+    // `--run` is scripted: a failed JSON write has to reach the process exit
+    // status, not just a row in the window that is about to close.
+    let failed = Rc::new(Cell::new(false));
+    let failed_activate = failed.clone();
+    app.connect_activate(move |app| build_ui(app, opts.clone(), failed_activate.clone()));
     // We already consumed our own flags; hand GApplication a clean argv so it
     // does not reject --run/--json/--windows.
-    app.run_with_args(&["wayland-compositor-bench"])
+    let code = app.run_with_args(&["wayland-compositor-bench"]);
+    if failed.get() {
+        glib::ExitCode::FAILURE
+    } else {
+        code
+    }
 }
 
-fn build_ui(app: &gtk::Application, opts: cli::Options) {
+fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Wayland Compositor Bench")
@@ -1106,6 +1121,8 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
                 stack_c.set_visible_child(&sui.root);
             })
         },
+        blur_off: blur_off.clone(),
+        failed: failed.clone(),
         scan: scan_cell.clone(),
         opts: opts.clone(),
     };
@@ -1163,7 +1180,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
                 "{} (pid {}, {} threads)",
                 c.name,
                 c.pid,
-                proc::threads(c.pid)
+                proc::status(c.pid).threads
             )
         })
         .unwrap_or_else(|| "not detected".into());
@@ -1321,36 +1338,73 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
 
     // first pass + 1 s refresh
     update(&labels_c, &monitor_c);
-    let cpu_state = Cell::new((std::time::Instant::now(), 0u64));
+    // Seed with the live counter, not zero: the first tick must not report the
+    // cumulative time since boot as one second of CPU.
+    let cg_t = proc::session_cgroup();
+    let cpu_state = Cell::new((std::time::Instant::now(), proc::cpu_usage_usec(cg_t)));
     let labels_t = labels.clone();
     let perf_tip_t = perf_tip.clone();
     let comp_t = comp_pid;
     let busy_t = busy.clone();
+    let tick = Cell::new(0u32);
     glib::timeout_add_local(Duration::from_secs(1), move || {
         // The benchmark is measuring this very process: park the pollers while a
         // run is in progress so the numbers do not include their own updater.
+        // Re-baseline on the way out, or the first tick after the run would
+        // present the run's average as one second of idle session.
         if busy_t.get() {
+            cpu_state.set((std::time::Instant::now(), proc::cpu_usage_usec(cg_t)));
             return glib::ControlFlow::Continue;
         }
+        let n = tick.get().wrapping_add(1);
+        tick.set(n);
+        // cgroup counters are two small reads: refresh them every second.
         let (last_t, last_cpu) = cpu_state.get();
-        let cg = proc::session_cgroup();
-        let now_cpu = proc::cpu_usage_usec(cg);
+        let snap = sysinfo::Snapshot::take_light();
         let dt = last_t.elapsed().as_secs_f64();
         if dt > 0.2 {
-            let pct = (now_cpu.saturating_sub(last_cpu)) as f64 / 1e6 / dt * 100.0;
+            let pct = snap.cpu_usec.saturating_sub(last_cpu) as f64 / 1e6 / dt * 100.0;
             set(&labels_t, "Session CPU", &format!("{pct:.2} % of one core"));
-            cpu_state.set((std::time::Instant::now(), now_cpu));
+            cpu_state.set((std::time::Instant::now(), snap.cpu_usec));
         }
-        let snap = sysinfo::Snapshot::take(comp_t);
         set(&labels_t, "Session memory", &sysinfo::fmt_mem(&snap));
-        set(
-            &labels_t,
-            "Peak memory (since login)",
-            &sysinfo::fmt_mib(proc::memory_peak_mib(cg)),
-        );
         // the profile can be switched at runtime by power-profiles-daemon
         set(&labels_t, "Performance mode", &sysinfo::performance_mode());
         set_performance_tip(&labels_t, &perf_tip_t);
+        // The `/proc` walks and hwmon reads below are the expensive part; once
+        // every five seconds is plenty, they do not change frame to frame.
+        if n.is_multiple_of(5) {
+            set(
+                &labels_t,
+                "Peak memory (since login)",
+                &sysinfo::fmt_mib(proc::memory_peak_mib(cg_t)),
+            );
+            if let Some(p) = comp_t {
+                set(
+                    &labels_t,
+                    "Compositor memory (PSS)",
+                    &sysinfo::fmt_mib(proc::pss_tree(p).0 as f64 / 1024.0),
+                );
+                let gpu = proc::gpu(p);
+                if gpu.available() {
+                    set(
+                        &labels_t,
+                        "GPU memory (compositor)",
+                        &sysinfo::fmt_mib(gpu.resident as f64 / 1048576.0),
+                    );
+                }
+            }
+            let ps = sysinfo::psi(cg_t, "cpu.pressure").unwrap_or((0.0, 0.0));
+            let pm = sysinfo::psi(cg_t, "memory.pressure").unwrap_or((0.0, 0.0));
+            set(
+                &labels_t,
+                "Pressure (cpu/mem)",
+                &format!("cpu {:.1}% / mem {:.1}% (avg10)", ps.0, pm.0),
+            );
+            if let Some(t) = sysinfo::package_temp_c() {
+                set(&labels_t, "Package temp", &format!("{t:.0} °C"));
+            }
+        }
         glib::ControlFlow::Continue
     });
 

@@ -1,12 +1,14 @@
 //! Idle power, from RAPL (whole SoC / CPU package) and the battery gauge.
 //!
-//! RAPL energy counters are root-only, so reading them falls back to
-//! `sudo -n cat`: passwordless sudo is a no-op prompt-wise, and without it the
-//! power columns simply come out empty instead of wrong.
+//! RAPL energy counters are root-only on most distros, so reading them falls
+//! back to `sudo -n cat`: passwordless sudo is a no-op prompt-wise, and without
+//! it the power columns simply come out empty instead of wrong. Set
+//! `WG_BENCH_NO_SUDO=1` to keep the tool from escalating at all.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Reading {
@@ -28,8 +30,8 @@ pub struct Sample {
 pub fn sample() -> Sample {
     let (psys, pkg) = domains();
     Sample {
-        psys: psys.and_then(|d| d.read()),
-        pkg: pkg.and_then(|d| d.read()),
+        psys: psys.as_ref().and_then(|d| d.read()),
+        pkg: pkg.as_ref().and_then(|d| d.read()),
     }
 }
 
@@ -67,6 +69,9 @@ fn read_u64(path: &Path) -> Option<u64> {
     if let Ok(s) = fs::read_to_string(path) {
         return s.trim().parse().ok();
     }
+    if std::env::var_os("WG_BENCH_NO_SUDO").is_some() {
+        return None;
+    }
     // root-only: energy_uj, and the cgroup files the script used to touch
     let out = Command::new("sudo")
         .args(["-n", "cat"])
@@ -80,36 +85,40 @@ fn read_u64(path: &Path) -> Option<u64> {
 }
 
 /// The psys and package-0 domains, found by name rather than by index: the
-/// numbering differs between platforms.
-fn domains() -> (Option<Domain>, Option<Domain>) {
-    let mut psys = None;
-    let mut pkg = None;
-    let Ok(rd) = fs::read_dir("/sys/class/powercap") else {
-        return (None, None);
-    };
-    for entry in rd.flatten() {
-        let dir = entry.path();
-        let Ok(name) = fs::read_to_string(dir.join("name")) else {
-            continue;
+/// numbering differs between platforms. Cached: the powercap tree does not
+/// change while the tool runs, and every sample used to re-read it.
+fn domains() -> &'static (Option<Domain>, Option<Domain>) {
+    static DOMAINS: OnceLock<(Option<Domain>, Option<Domain>)> = OnceLock::new();
+    DOMAINS.get_or_init(|| {
+        let mut psys = None;
+        let mut pkg = None;
+        let Ok(rd) = fs::read_dir("/sys/class/powercap") else {
+            return (None, None);
         };
-        let name = name.trim();
-        let Some(max) = fs::read_to_string(dir.join("max_energy_range_uj"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-        else {
-            continue;
-        };
-        let domain = Domain {
-            energy: dir.join("energy_uj"),
-            max,
-        };
-        match name {
-            "psys" => psys = Some(domain),
-            "package-0" => pkg = Some(domain),
-            _ => {}
+        for entry in rd.flatten() {
+            let dir = entry.path();
+            let Ok(name) = fs::read_to_string(dir.join("name")) else {
+                continue;
+            };
+            let name = name.trim();
+            let Some(max) = fs::read_to_string(dir.join("max_energy_range_uj"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            else {
+                continue;
+            };
+            let domain = Domain {
+                energy: dir.join("energy_uj"),
+                max,
+            };
+            match name {
+                "psys" => psys = Some(domain),
+                "package-0" => pkg = Some(domain),
+                _ => {}
+            }
         }
-    }
-    (psys, pkg)
+        (psys, pkg)
+    })
 }
 
 /// The first battery, with its status string.
@@ -129,11 +138,16 @@ pub fn battery() -> Option<(PathBuf, String)> {
 }
 
 /// Whether the two RAPL domains can be read at all, for `--check`.
+///
+/// Cached per domain: the answer cannot change while the process runs, and on a
+/// root-only machine every call used to fork `sudo` twice.
 pub fn readable() -> (bool, bool) {
+    static PSYS: OnceLock<bool> = OnceLock::new();
+    static PKG: OnceLock<bool> = OnceLock::new();
     let (psys, pkg) = domains();
     (
-        psys.and_then(|d| d.read()).is_some(),
-        pkg.and_then(|d| d.read()).is_some(),
+        *PSYS.get_or_init(|| psys.as_ref().and_then(|d| d.read()).is_some()),
+        *PKG.get_or_init(|| pkg.as_ref().and_then(|d| d.read()).is_some()),
     )
 }
 

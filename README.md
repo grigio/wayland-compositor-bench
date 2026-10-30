@@ -24,9 +24,11 @@ translucent, blurred window background for a plain opaque one. Blur is a real
 cost for the compositor, so the switch makes runs comparable between
 compositors that blur and ones that do not.
 
-`--run` measures immediately and **exits when done**, so it can sit in a script.
-The JSON lands in `results/<label>-<timestamp>.json`; the label defaults to the
-desktop the running compositor belongs to (`GNOME`, `labwc`, …), falling back to
+`--run` measures immediately and **exits when done**, so it can sit in a script;
+it exits non-zero if the JSON cannot be written. The JSON lands in
+`$XDG_STATE_HOME/wayland-compositor-bench/results/`
+(`~/.local/state/...` by default); the label defaults to the desktop the
+running compositor belongs to (`GNOME`, `labwc`, …), falling back to
 `XDG_CURRENT_DESKTOP` when the two agree, so a session flavour like
 `ubuntu:GNOME` is kept (`--label` to override).
 
@@ -35,11 +37,15 @@ the difference between identical runs is usually bigger than the one you are
 chasing.
 
 ```bash
-./target/release/wayland-compositor-bench --report              # medians of results/*.json
+./target/release/wayland-compositor-bench --report              # medians of saved runs
 ./target/release/wayland-compositor-bench --report ~/runs/labwc # a directory, files, or labels
 ./target/release/wayland-compositor-bench --compare labwc gnome # side by side, with a noise floor
 ./target/release/wayland-compositor-bench --compare labwc gnome ~/runs # …reading a directory
 ```
+
+With no path, `--report` reads the XDG results directory **and** `./results`, so
+runs made from the repository keep working. `--check` exits `2` when the session
+is measurable only with caveats, so a script can gate on it.
 
 Flags: `--idle S` (20), `--frames S` per frame test (6), `--windows N` (6),
 `--settle S` max wait for quiet (45). `--help` for the rest.
@@ -54,20 +60,21 @@ sudo pacman -U wayland-compositor-bench-*.pkg.tar.zst     # Arch
 sudo apt install ./wayland-compositor-bench_*_amd64.deb   # Debian / Ubuntu
 ```
 
-Both packages install `/usr/bin/wayland-compositor-bench`. The Debian package is built on
-Debian 13 (GTK 4.18) so the dependency floor is honest; the Arch package is
-built by `PKGBUILD` in the repository root.
+Both packages install `/usr/bin/wayland-compositor-bench` plus a `.desktop`
+launcher and a hicolor icon, so it also appears in the application menu. The
+Debian package is built on Debian 13 (GTK 4.18) so the dependency floor is
+honest; the Arch package is built by `PKGBUILD` in the repository root.
 
 ## What it measures
 
 | phase | what you get |
 |---|---|
-| **idle** | session working set, compositor PSS, session and compositor CPU, compositor wakeups/s, package and battery power |
+| **idle** | session working set, compositor PSS, session and compositor CPU, attributed other CPU, compositor wakeups/s, package and battery power |
 | **toplevels** | the same session with N extra windows open: working set delta, GPU memory held by client and compositor |
-| **frames (single)** | one animated surface: fps, cadence, p50/p95/max interval, missed frames, compositor CPU/frame, GPU/frame, app CPU/frame |
+| **frames (single)** | one animated surface: fps, cadence, p50/p95/max interval, missed frames, compositor CPU/frame, GPU/frame, app CPU/frame, package and battery power for the test |
 | **frames (multi)** | the same surface plus N animated toplevels — what a real desktop does all day |
 | **protocols** | every `wl_registry` global with its version, grouped by tier |
-| **peaks** | 25 ms sampler for RAM and CPU spikes during the run |
+| **peaks** | 25 ms sampler for RAM and CPU spikes during the run; the 100 ms CPU timeline and phase marks are saved in the JSON |
 
 Everything is read from `/proc`, the session's cgroup v2 and sysfs:
 
@@ -106,6 +113,9 @@ Everything is read from `/proc`, the session's cgroup v2 and sysfs:
   worse than one that read nothing.
 - `psys` is the whole SoC (CPU + iGPU + fabric) — the best battery proxy. `pkg`
   is the CPU package alone, `bat` is what the battery reports.
+- `other CPU` is session CPU that is neither the compositor nor this tool. A
+  `quiet cpu` check fails above 5 % and names the top offenders, so an
+  unexplained idle figure comes with a diagnosis.
 - Coverage counts only the **Core / Rendering / Desktop** tiers. wlroots-only
   and optional protocols are listed with their versions but not scored;
   otherwise the number rewards a design choice.
@@ -114,8 +124,10 @@ Everything is read from `/proc`, the session's cgroup v2 and sysfs:
 
 Every run carries a `confidence` of `high`, `medium` or `low`, derived from
 checks stored in the JSON: session scope found, compositor resolved by socket,
-presentation feedback, display refresh known, session clean. `--report` prints
-what downgraded a run.
+presentation feedback, display refresh known, session clean, quiet CPU. When
+`--json` writes a run it also stores the 100 ms CPU timeline and its phase
+marks, so spike patterns survive the medians. `--report` prints the failing
+checks and warns when a label mixes blur states.
 
 ## Making runs comparable
 
@@ -124,13 +136,16 @@ what downgraded a run.
    block is in every JSON, and `--report`/`--compare` warn when they differ.
 2. **Same power state.** On battery, discharging, same platform profile and
    brightness. Plugging in changes both the drain and the thermals.
-3. **Clean session.** The tool flags processes over 150 MiB; close them. Lazy
-   portals arrive seconds after login, so the run waits for the session to go
-   quiet instead of sleeping a fixed time.
-4. **Compare within a tier.** labwc is a WM; GNOME is a WM plus a shell, search,
+3. **Clean session.** The tool flags processes over 150 MiB and CPU outside the
+   compositor and itself; close them. Lazy portals arrive seconds after login,
+   so the run waits for the session to go quiet instead of sleeping a fixed
+   time.
+4. **Same blur state.** The chip is recorded in every JSON; `--report` warns
+   when a label mixes blur on and off, because blur is real compositor work.
+5. **Compare within a tier.** labwc is a WM; GNOME is a WM plus a shell, search,
    notifications and portals. Measure bare sessions and full desktops, and say
    which one you are reporting.
-5. **Three runs, and use `--compare`.** It subtracts the observed spread and
+6. **Three runs, and use `--compare`.** It subtracts the observed spread and
    refuses to call a difference smaller than the noise.
 
 The benchmark's own window is a real client: it counts toward the compositor's
@@ -139,8 +154,12 @@ compositor must composite.
 
 ## Permissions
 
-RAPL `energy_uj` is `0400 root` on most distros. Nothing here needs root; power
-is optional. To read it without sudo:
+RAPL `energy_uj` is `0400 root` on most distros. Power is optional and no
+measurement requires root: when the file is not world-readable the tool tries a
+non-interactive `sudo -n cat` for each power sample and never prompts. Set
+`WG_BENCH_NO_SUDO=1` to forbid that. Readings are taken outside the CPU
+measurement windows, so the fork cannot be charged to the session. To read it
+without sudo:
 
 ```bash
 # /etc/udev/rules.d/99-rapl-read.rules

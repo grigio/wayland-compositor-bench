@@ -48,6 +48,8 @@ pub struct Summary {
     pub cpu_pct: f64,
     pub cpu_avg_pct: f64,
     pub cpu_peak_pct: f64,
+    /// session CPU that was neither the compositor nor this benchmark
+    pub other_cpu_pct: f64,
     pub comp_mib: f64,
     pub comp_ms_per_frame: f64,
     pub gpu_ms_per_frame: Option<f64>,
@@ -86,6 +88,10 @@ pub struct BenchUi {
     /// true while a run is in progress: the live labels pause so the benchmark
     /// is not measuring its own updater
     pub busy: Rc<Cell<bool>>,
+    /// the blur chip's state, so the run JSON can say whether blur was on
+    pub blur_off: Rc<Cell<bool>>,
+    /// set when `--run` could not write its JSON; the process must exit non-zero
+    pub failed: Rc<Cell<bool>>,
     pub summary: Rc<dyn Fn(Summary)>,
     pub scan: Rc<RefCell<Option<wlscan::Scan>>>,
     pub opts: Options,
@@ -110,6 +116,8 @@ impl Clone for BenchUi {
             logical: self.logical,
             scale: self.scale,
             busy: self.busy.clone(),
+            blur_off: self.blur_off.clone(),
+            failed: self.failed.clone(),
             summary: self.summary.clone(),
             scan: self.scan.clone(),
             opts: self.opts.clone(),
@@ -181,13 +189,23 @@ struct Series {
     points: Vec<CpuPoint>,
     /// phase boundaries on the same clock
     marks: Vec<CpuMark>,
+    /// Baseline for the next sample, in the shared state so whoever resets the
+    /// timeline (main thread or sampler) re-baselines it as well. Keeping these
+    /// in the thread-local loop made the first post-settle sample span the
+    /// whole settle period.
+    last_t: Option<Instant>,
+    last_cpu: u64,
 }
 
 impl Series {
-    fn clear(&mut self) {
+    /// Start a new measurable run at `now`, with the cgroup counter `cpu` as
+    /// the baseline for the next sample.
+    fn reset_at(&mut self, now: Instant, cpu: u64) {
         self.t0 = None;
         self.points.clear();
         self.marks.clear();
+        self.last_t = Some(now);
+        self.last_cpu = cpu;
     }
 
     fn at(&mut self, now: Instant) -> f32 {
@@ -212,16 +230,18 @@ impl Series {
 /// Average CPU load across the run, in % of one core.
 ///
 /// Every sample is the load measured between the previous one and its own
-/// timestamp, so it is weighted by the span it actually describes rather than
-/// counted once: the sampler wakes every 25 ms and records every ~100 ms, which
-/// is nearly uniform but not exactly.
+/// timestamp, so it describes the interval *ending* at its timestamp. The
+/// trapezoid rule is the matching estimator: each point is the right edge of
+/// the interval before it and the left edge of the interval after it. Weighting
+/// `points[i]` by the following interval (the old code) attributed every sample
+/// to the wrong side and dropped the last real one.
 fn mean_cpu(points: &[CpuPoint]) -> f64 {
     let mut weighted = 0.0;
     let mut total = 0.0;
     for pair in points.windows(2) {
         let dt = f64::from(pair[1].0 - pair[0].0);
         if dt > 0.0 {
-            weighted += f64::from(pair[0].1) * dt;
+            weighted += (f64::from(pair[0].1) + f64::from(pair[1].1)) * 0.5 * dt;
             total += dt;
         }
     }
@@ -240,9 +260,6 @@ struct Sampler {
     stop: Arc<AtomicBool>,
     peak_mem: Arc<AtomicU64>,
     peak_cpu: Arc<AtomicU64>,
-    /// Set by `reset`: the thread then throws away everything sampled during the
-    /// settle-in, which is not part of the run.
-    restart: Arc<AtomicBool>,
     series: Arc<Mutex<Series>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -252,28 +269,20 @@ impl Sampler {
         let stop = Arc::new(AtomicBool::new(false));
         let peak_mem = Arc::new(AtomicU64::new(0));
         let peak_cpu = Arc::new(AtomicU64::new(0));
-        let restart = Arc::new(AtomicBool::new(false));
         let series = Arc::new(Mutex::new(Series::default()));
-        let (s, m, c, r, se) = (
+        let (s, m, c, se) = (
             stop.clone(),
             peak_mem.clone(),
             peak_cpu.clone(),
-            restart.clone(),
             series.clone(),
         );
         let join = std::thread::spawn(move || {
             let dir = proc::session_cgroup();
             let stat_path = dir.join("memory.stat");
-            let mut last_t = Instant::now();
-            let mut last_cpu = proc::cpu_usage_usec(dir);
+            if let Ok(mut se) = se.lock() {
+                se.reset_at(Instant::now(), proc::cpu_usage_usec(dir));
+            }
             while !s.load(Ordering::Relaxed) {
-                if r.swap(false, Ordering::Relaxed) {
-                    if let Ok(mut se) = se.lock() {
-                        se.clear();
-                    }
-                    last_t = Instant::now();
-                    last_cpu = proc::cpu_usage_usec(dir);
-                }
                 // Peak *working set*, not `memory.current`: the latter is mostly
                 // page cache, which moves with whatever else the session reads.
                 if let Ok(text) = std::fs::read_to_string(&stat_path) {
@@ -293,18 +302,27 @@ impl Sampler {
                 }
                 let cpu = proc::cpu_usage_usec(dir);
                 let now = Instant::now();
+                let Ok(mut se) = se.lock() else {
+                    break;
+                };
+                let Some(last_t) = se.last_t else {
+                    se.last_t = Some(now);
+                    se.last_cpu = cpu;
+                    drop(se);
+                    std::thread::sleep(Duration::from_millis(PEAK_PERIOD_MS));
+                    continue;
+                };
                 let dt = now.duration_since(last_t).as_secs_f64();
-                if dt >= 0.10 && cpu >= last_cpu {
-                    let pct = (cpu - last_cpu) as f64 / 1e6 / dt * 100.0;
+                if dt >= 0.10 && cpu >= se.last_cpu {
+                    let pct = (cpu - se.last_cpu) as f64 / 1e6 / dt * 100.0;
                     // positive floats order the same as their bit patterns, so
                     // fetch_max on the bits is a numeric max
                     c.fetch_max(pct.to_bits(), Ordering::Relaxed);
-                    if let Ok(mut se) = se.lock() {
-                        se.push(now, pct);
-                    }
-                    last_t = now;
-                    last_cpu = cpu;
+                    se.push(now, pct);
+                    se.last_t = Some(now);
+                    se.last_cpu = cpu;
                 }
+                drop(se);
                 std::thread::sleep(Duration::from_millis(PEAK_PERIOD_MS));
             }
         });
@@ -312,29 +330,30 @@ impl Sampler {
             stop,
             peak_mem,
             peak_cpu,
-            restart,
             series,
             join: Some(join),
         }
     }
 
     /// Starts the measurable run: peaks back to zero, timeline back to t = 0.
+    /// The baseline is re-read here, not left for the sampling thread, so the
+    /// first sample cannot span the settle period.
     fn reset(&self) {
         self.peak_mem.store(0, Ordering::Relaxed);
         self.peak_cpu.store(0, Ordering::Relaxed);
-        self.restart.store(true, Ordering::Relaxed);
+        let now = Instant::now();
+        let cpu = proc::cpu_usage_usec(proc::session_cgroup());
+        if let Ok(mut se) = self.series.lock() {
+            se.reset_at(now, cpu);
+        }
     }
 
     /// Names the phase that starts now, for the verticals on the timeline.
+    /// It does not touch the sampling baseline: `reset` already did.
     fn mark(&self, name: &'static str) {
         let Ok(mut se) = self.series.lock() else {
             return;
         };
-        // If the sampling thread has not consumed the reset yet, do it here so
-        // the first mark does not land on the pre-run clock.
-        if self.restart.swap(false, Ordering::Relaxed) {
-            se.clear();
-        }
         se.mark(Instant::now(), name);
     }
 
@@ -372,14 +391,40 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(pid: Option<u32>) -> Self {
+    /// Before the measured window: scans first, then the session/app counters
+    /// and the timestamp, so the probe's own `/proc` walk is outside the window.
+    fn before(pid: Option<u32>) -> Self {
+        let tasks = pid.map(proc::tasks).unwrap_or_default();
+        let comp_ns = tasks.iter().map(|t| t.ns).sum();
+        let gpu = pid.map(proc::gpu).unwrap_or_default();
+        let session_usec = proc::cpu_usage_usec(proc::session_cgroup());
+        let app_ns = proc::cpu_ns(std::process::id());
         Self {
-            comp_ns: pid.map(proc::cpu_ns).unwrap_or(0),
-            tasks: pid.map(proc::tasks).unwrap_or_default(),
-            gpu: pid.map(proc::gpu).unwrap_or_default(),
-            session_usec: proc::cpu_usage_usec(proc::session_cgroup()),
-            app_ns: proc::cpu_ns(std::process::id()),
+            comp_ns,
+            tasks,
+            gpu,
+            session_usec,
+            app_ns,
             at: Instant::now(),
+        }
+    }
+
+    /// After the measured window: counters and timestamp first, then the
+    /// scans, so the probe does not charge its own work to the session.
+    fn after(pid: Option<u32>) -> Self {
+        let session_usec = proc::cpu_usage_usec(proc::session_cgroup());
+        let app_ns = proc::cpu_ns(std::process::id());
+        let at = Instant::now();
+        let tasks = pid.map(proc::tasks).unwrap_or_default();
+        let comp_ns = tasks.iter().map(|t| t.ns).sum();
+        let gpu = pid.map(proc::gpu).unwrap_or_default();
+        Self {
+            comp_ns,
+            tasks,
+            gpu,
+            session_usec,
+            app_ns,
+            at,
         }
     }
 }
@@ -392,10 +437,12 @@ fn thread_shares(
     if total_ns == 0 {
         return Vec::new();
     }
+    let before_ns: std::collections::HashMap<u32, u64> =
+        before.iter().map(|t| (t.tid, t.ns)).collect();
     let mut out: Vec<report::ThreadShare> = after
         .iter()
         .filter_map(|t| {
-            let prev = before.iter().find(|p| p.tid == t.tid)?.ns;
+            let prev = *before_ns.get(&t.tid)?;
             let delta = t.ns.saturating_sub(prev);
             (delta > 0).then(|| report::ThreadShare {
                 name: t.comm.clone(),
@@ -611,11 +658,53 @@ pub fn start(ui: BenchUi) {
     });
 }
 
+struct Settle {
+    seconds: f64,
+    /// the busiest processes outside the compositor and this tool, largest first
+    top_cpu: Vec<(String, f64)>,
+}
+
+/// Session CPU split into "the thing being measured", "this tool" and
+/// "everything else". The last number is what turns an unexplained 46 % idle
+/// figure into a diagnosis.
+fn cpu_attribution(
+    before: &proc::CpuSnapshot,
+    after: &proc::CpuSnapshot,
+    seconds: f64,
+    exclude: &[u32],
+) -> (f64, Vec<(String, f64)>) {
+    if seconds <= 0.0 {
+        return (0.0, Vec::new());
+    }
+    let total_pct =
+        after.total_usec.saturating_sub(before.total_usec) as f64 / 1e6 / seconds * 100.0;
+    let before_ns: std::collections::HashMap<u32, u64> = before
+        .procs
+        .iter()
+        .map(|(pid, _, ns)| (*pid, *ns))
+        .collect();
+    let mut excluded_pct = 0.0;
+    let mut top: Vec<(String, f64)> = Vec::new();
+    for (pid, name, ns) in &after.procs {
+        let delta = ns.saturating_sub(*before_ns.get(pid).unwrap_or(&0));
+        let pct = delta as f64 / 1e9 / seconds * 100.0;
+        if exclude.contains(pid) {
+            excluded_pct += pct;
+        } else if pct > 0.05 {
+            top.push((name.clone(), pct));
+        }
+    }
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top.truncate(3);
+    ((total_pct - excluded_pct).max(0.0), top)
+}
+
 /// Wait until session CPU stops moving. Lazy portals and login animations land
 /// seconds after the window appears, so a fixed sleep is either too short or
 /// wasteful.
-async fn settle(ui: &BenchUi, max_s: f64) -> f64 {
+async fn settle(ui: &BenchUi, max_s: f64, exclude: &[u32]) -> Settle {
     let start = Instant::now();
+    let before = proc::cpu_snapshot();
     let mut windows: Vec<f64> = Vec::new();
     loop {
         let t0 = Instant::now();
@@ -643,7 +732,10 @@ async fn settle(ui: &BenchUi, max_s: f64) -> f64 {
             }
         }
     }
-    start.elapsed().as_secs_f64()
+    let seconds = start.elapsed().as_secs_f64();
+    let after = proc::cpu_snapshot();
+    let (_, top_cpu) = cpu_attribution(&before, &after, seconds, exclude);
+    Settle { seconds, top_cpu }
 }
 
 async fn run(ui: BenchUi) {
@@ -676,6 +768,10 @@ async fn run(ui: BenchUi) {
         compositor_hz: Some(ui.refresh_hz),
     };
     let env = sysinfo::Env::collect(hint, comp.as_ref());
+    // Probe both once: `readable()` may fork `sudo` per domain, and the check
+    // needs the same answer for `ok` and for `detail`.
+    let rapl = power::readable();
+    let batt = power::battery();
 
     let mut checks = vec![
         report::Check {
@@ -715,11 +811,8 @@ async fn run(ui: BenchUi) {
         },
         report::Check {
             name: "RAPL power".into(),
-            ok: {
-                let (p, k) = power::readable();
-                p || k
-            },
-            detail: match power::readable() {
+            ok: rapl.0 || rapl.1,
+            detail: match rapl {
                 (true, true) => "psys + package".into(),
                 (true, false) => "psys only".into(),
                 (false, true) => "package only".into(),
@@ -728,18 +821,20 @@ async fn run(ui: BenchUi) {
         },
         report::Check {
             name: "battery discharging".into(),
-            ok: power::battery()
+            ok: batt
+                .as_ref()
                 .map(|(_, s)| s == "Discharging")
                 .unwrap_or(false),
-            detail: power::battery()
-                .map(|(_, s)| s)
+            detail: batt
+                .as_ref()
+                .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| "no battery".into()),
         },
         report::Check {
             name: "clean session".into(),
             ok: contaminants.is_empty(),
             detail: if contaminants.is_empty() {
-                "nothing over 150 MiB".into()
+                format!("nothing over {} MiB", sysinfo::CONTAMINANT_MIB as u32)
             } else {
                 contaminants
                     .iter()
@@ -754,7 +849,8 @@ async fn run(ui: BenchUi) {
     let sampler = Sampler::start();
 
     // ------------------------------------------------------------- idle ---
-    let settle_s = settle(&ui, opts.settle_s).await;
+    let settle = settle(&ui, opts.settle_s, &exclude).await;
+    let settle_s = settle.seconds;
     sampler.reset();
     sampler.mark("idle");
     ui.set_status(&format!(
@@ -762,16 +858,21 @@ async fn run(ui: BenchUi) {
         opts.idle_s
     ));
     ui.progress.set_fraction(0.25);
-    let i0 = Snapshot::take(pid);
+    // Power is sampled outside the CPU window: on a root-only-RAPL machine the
+    // reading forks `sudo`, and that fork must not be charged to the session.
     let pw0 = power::sample();
+    let i0 = Snapshot::take(pid);
     glib::timeout_future(Duration::from_secs_f64(opts.idle_s)).await;
     let i1 = Snapshot::take(pid);
     let pw1 = power::sample();
     let (cpu_pct, comp_pct) = i0.delta_cpu(&i1, opts.idle_s);
+    let self_pct = i0.delta_self_cpu(&i1, opts.idle_s);
+    let other_cpu_pct = (cpu_pct - comp_pct - self_pct).max(0.0);
     let wakeups = i1.comp_wakeups.saturating_sub(i0.comp_wakeups) as f64 / opts.idle_s;
     let (psys_w, pkg_w) = power::delta(pw0, pw1, opts.idle_s);
-    let batt_status = power::battery()
-        .map(|(_, s)| s)
+    let batt_status = batt
+        .as_ref()
+        .map(|(_, s)| s.clone())
         .unwrap_or_else(|| "unknown".into());
     let batt_w = power::battery_watts();
     let idle_peak_mib = sampler.peaks().0.max(i1.working_set_mib());
@@ -780,6 +881,22 @@ async fn run(ui: BenchUi) {
         &i1.comp_tasks,
         i1.comp_ns.saturating_sub(i0.comp_ns),
     );
+
+    let top_cpu = settle
+        .top_cpu
+        .iter()
+        .map(|(name, pct)| format!("{name} {pct:.1}%"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    checks.push(report::Check {
+        name: "quiet cpu".into(),
+        ok: other_cpu_pct <= 5.0,
+        detail: if top_cpu.is_empty() {
+            format!("{other_cpu_pct:.1}% outside the compositor and this tool")
+        } else {
+            format!("{other_cpu_pct:.1}% outside the compositor and this tool: {top_cpu}")
+        },
+    });
 
     let comp_mib = i1.comp_pss_mib;
     ui.section("idle session");
@@ -807,6 +924,13 @@ async fn run(ui: BenchUi) {
     ui.add("  processes", &i1.procs.to_string());
     ui.add("session CPU", &format!("{cpu_pct:.2} % of one core"));
     ui.add("compositor CPU", &format!("{comp_pct:.2} % of one core"));
+    ui.add(
+        "other CPU",
+        &format!("{other_cpu_pct:.2} % of one core (neither compositor nor this tool)"),
+    );
+    if !top_cpu.is_empty() {
+        ui.add("  top CPU users", &top_cpu);
+    }
     ui.add("compositor wakeups", &format!("{wakeups:.0} /s"));
     ui.add("compositor PSS", &format!("{:.0} MiB", comp_mib));
     ui.add(
@@ -978,6 +1102,7 @@ async fn run(ui: BenchUi) {
         cpu_pct,
         cpu_avg_pct: cpu_avg,
         cpu_peak_pct: peak_cpu,
+        other_cpu_pct,
         comp_mib,
         comp_ms_per_frame: single.as_ref().map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
         gpu_ms_per_frame: single.as_ref().and_then(|r| r.gpu_ms_per_frame),
@@ -989,8 +1114,8 @@ async fn run(ui: BenchUi) {
         feat_extra: feats.extra,
         feat_items: feats.items.clone(),
         confidence,
-        cpu_series,
-        cpu_marks,
+        cpu_series: cpu_series.clone(),
+        cpu_marks: cpu_marks.clone(),
     });
 
     // --------------------------------------------------------------- json ---
@@ -1012,6 +1137,7 @@ async fn run(ui: BenchUi) {
             desktop_env: desktop.env.clone(),
             cgroup: proc::session_cgroup().display().to_string(),
             cgroup_exact: proc::cgroup_exact(),
+            blur: if ui.blur_off.get() { "off" } else { "on" }.into(),
             confidence: confidence.to_string(),
             checks,
             clean: contaminants.is_empty(),
@@ -1038,6 +1164,7 @@ async fn run(ui: BenchUi) {
                 procs: i1.procs,
                 cpu_pct,
                 comp_cpu_pct: comp_pct,
+                other_cpu_pct,
                 wakeups_per_s: wakeups,
                 comp_pss_mib: comp_mib,
                 psys_w,
@@ -1069,7 +1196,29 @@ async fn run(ui: BenchUi) {
                 cpu_idle_pct: cpu_pct,
                 cpu_avg_pct: Some(cpu_avg),
                 cpu_peak_pct: peak_cpu,
+                cpu_series: Some(
+                    cpu_series
+                        .iter()
+                        .map(|(t_s, pct)| report::CpuPoint {
+                            t_s: *t_s,
+                            pct: *pct,
+                        })
+                        .collect(),
+                ),
+                cpu_marks: Some(
+                    cpu_marks
+                        .iter()
+                        .map(|(t_s, phase)| report::CpuMark {
+                            t_s: *t_s,
+                            phase: (*phase).to_string(),
+                        })
+                        .collect(),
+                ),
             }),
+        };
+        let target_name = match target {
+            crate::cli::JsonTarget::Path(p) => p.display().to_string(),
+            crate::cli::JsonTarget::Auto => report::results_dir().display().to_string(),
         };
         match run.write(target) {
             Ok(path) => {
@@ -1078,7 +1227,12 @@ async fn run(ui: BenchUi) {
                 }
                 ui.add("written to", &path.display().to_string());
             }
-            Err(e) => ui.add("write failed", &e.to_string()),
+            Err(e) => {
+                let msg = format!("cannot write {target_name}: {e}");
+                eprintln!("wayland-compositor-bench: {msg}");
+                ui.add("write failed", &msg);
+                ui.failed.set(true);
+            }
         }
     }
 
@@ -1140,9 +1294,15 @@ async fn frame_test(
         glib::ControlFlow::Continue
     });
 
-    let before = Probe::new(pid);
+    // RAPL/battery brackets sit outside the CPU window: the frame test then
+    // answers "what does animating these surfaces cost in watts" without the
+    // reading itself landing in the session CPU delta.
+    let pw0 = power::sample();
+    let before = Probe::before(pid);
     glib::timeout_future(Duration::from_secs_f64(dur_s)).await;
-    let after = Probe::new(pid);
+    let after = Probe::after(pid);
+    let pw1 = power::sample();
+    let batt_w = power::battery_watts();
     let wall = after.at.duration_since(before.at).as_secs_f64();
     tick.remove();
 
@@ -1159,6 +1319,9 @@ async fn frame_test(
     let app_ms = after.app_ns.saturating_sub(before.app_ns) as f64 / 1e9 * 1000.0 / frames;
     let gpu = proc::gpu_cost(&before.gpu, &after.gpu, wall).map(|c| c.busy_s * 1000.0 / frames);
     let session_cpu = after.session_usec.saturating_sub(before.session_usec) as f64 / 1e6;
+    let self_cpu = after.app_ns.saturating_sub(before.app_ns) as f64 / 1e9;
+    let session_cpu_excl_self = (session_cpu - self_cpu).max(0.0);
+    let (psys_w, pkg_w) = power::delta(pw0, pw1, wall);
     let threads = thread_shares(&before.tasks, &after.tasks, comp_ns);
 
     ui.section(&format!("frame timing · {scenario}"));
@@ -1192,8 +1355,21 @@ async fn frame_test(
     ui.add("app CPU per frame", &format!("{app_ms:.3} ms"));
     ui.add(
         "session CPU during test",
-        &format!("{session_cpu:.2} s over {dur_s:.0} s"),
+        &format!(
+            "{session_cpu:.2} s over {dur_s:.0} s ({session_cpu_excl_self:.2} s excluding this tool)"
+        ),
     );
+    ui.add(
+        "power during test",
+        &match (psys_w, pkg_w) {
+            (Some(ps), Some(pk)) => format!("{ps:.1} W psys · {pk:.1} W pkg"),
+            (Some(ps), None) => format!("{ps:.1} W psys"),
+            _ => "not readable (root-only, see README)".to_string(),
+        },
+    );
+    if let Some(w) = batt_w {
+        ui.add("  battery draw", &format!("{w:.1} W"));
+    }
     ui.add("pacing source", p.source);
     if let Some(top) = threads.first() {
         ui.add(
@@ -1219,6 +1395,11 @@ async fn frame_test(
         gpu_ms_per_frame: gpu,
         app_ms_per_frame: app_ms,
         session_cpu_s: session_cpu,
+        self_cpu_s: self_cpu,
+        session_cpu_excl_self_s: session_cpu_excl_self,
+        psys_w,
+        pkg_w,
+        batt_w,
         threads,
     })
 }
@@ -1236,7 +1417,11 @@ fn confidence(checks: &[report::Check]) -> &'static str {
     };
     if bad("session cgroup") || bad("compositor process") {
         "low"
-    } else if bad("presentation feedback") || bad("display refresh") || bad("clean session") {
+    } else if bad("presentation feedback")
+        || bad("display refresh")
+        || bad("clean session")
+        || bad("quiet cpu")
+    {
         "medium"
     } else {
         "high"
@@ -1251,7 +1436,8 @@ mod tests {
     fn cpu_average_weights_each_sample_by_its_span() {
         // 10 % of a core for the first half of the run, 100 % for the second
         let pts: Vec<CpuPoint> = vec![(0.0, 10.0), (0.5, 100.0), (1.0, 100.0)];
-        assert!((mean_cpu(&pts) - 55.0).abs() < 1e-6);
+        // trapezoid: (10+100)/2 over 0.5 s + (100+100)/2 over 0.5 s
+        assert!((mean_cpu(&pts) - 77.5).abs() < 1e-6);
         // a sample that never got an interval of its own is not invented
         assert_eq!(mean_cpu(&[]), 0.0);
         assert!((mean_cpu(&[(0.0, 42.0)]) - 42.0).abs() < 1e-6);

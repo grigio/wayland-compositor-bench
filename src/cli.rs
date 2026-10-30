@@ -8,15 +8,16 @@ wayland-compositor-bench — measure the Wayland session you are logged into
 USAGE:
     wayland-compositor-bench                        open the window, press Start
     wayland-compositor-bench --run [--json [FILE]]  start measuring as soon as it is up
-    wayland-compositor-bench --report [PATH…]       print medians of results/*.json
+    wayland-compositor-bench --report [PATH…]       print medians of saved runs
     wayland-compositor-bench --compare A B [PATH…]  two labels side by side, with noise floor
     wayland-compositor-bench --check                can this session be measured reliably?
     wayland-compositor-bench --help
 
 OPTIONS:
     --run               run the benchmark ~1 s after the window appears
-    --json [FILE]       write the finished run to FILE
-                        (default: results/<label>-<timestamp>.json)
+    --json [FILE]       write the finished run to FILE (default:
+                        $XDG_STATE_HOME/wayland-compositor-bench/results/
+                        <label>-<timestamp>.json)
     --label NAME        name the run; defaults to the running desktop
                         (XDG_CURRENT_DESKTOP, unless it contradicts the
                         compositor process)
@@ -25,22 +26,25 @@ OPTIONS:
     --frames SECONDS    length of each frame test (default 6)
     --windows N         extra toplevels (default 6)
     --report [PATH…]    aggregate results: a directory, JSON files, or
-                        label substrings
+                        label substrings; no PATH means the XDG results
+                        directory plus ./results
     --compare A B [PATH…]
                         compare two saved labels, reading PATH like --report
-    --check             probe the session and print what is measurable
+    --check             probe the session and print what is measurable;
+                        exits 2 when it is measurable only with caveats
     -h, --help          this text
     -V, --version       print the version
 
 ENVIRONMENT:
     WG_BENCH_AUTORUN=1  same as --run
     WG_BENCH_PRINT=1    echo every result row to stdout
+    WG_BENCH_NO_SUDO=1  never use `sudo -n` for root-only RAPL counters
 ";
 
 /// Where the finished run goes.
 #[derive(Clone, Debug)]
 pub enum JsonTarget {
-    /// `results/<label>-<timestamp>.json`, next to the working directory.
+    /// `$XDG_STATE_HOME/wayland-compositor-bench/results/<label>-<timestamp>.json`.
     Auto,
     Path(PathBuf),
 }

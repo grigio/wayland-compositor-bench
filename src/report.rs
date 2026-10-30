@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::JsonTarget;
-use crate::sysinfo::Env;
+use crate::sysinfo::{self, Env};
 
 pub const SCHEMA_VERSION: u32 = 3;
 
@@ -36,6 +36,23 @@ pub struct ThreadShare {
     pub name: String,
     pub tid: u32,
     pub share_pct: f64,
+}
+
+/// One point of the session CPU timeline: seconds since the run started, CPU %
+/// of one core. Only written with `--json`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpuPoint {
+    pub t_s: f32,
+    pub pct: f32,
+}
+
+/// A phase boundary on the same clock as `CpuPoint`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CpuMark {
+    pub t_s: f32,
+    pub phase: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -57,6 +74,8 @@ pub struct IdlePhase {
     pub procs: usize,
     pub cpu_pct: f64,
     pub comp_cpu_pct: f64,
+    /// session CPU not attributable to the compositor or to this benchmark
+    pub other_cpu_pct: f64,
     pub wakeups_per_s: f64,
     pub comp_pss_mib: f64,
     /// null when RAPL is unreadable or the battery is not discharging
@@ -115,6 +134,14 @@ pub struct RenderPhase {
     pub gpu_ms_per_frame: Option<f64>,
     pub app_ms_per_frame: f64,
     pub session_cpu_s: f64,
+    /// this benchmark's own CPU time during the same window
+    pub self_cpu_s: f64,
+    /// `session_cpu_s - self_cpu_s`, the honest session figure
+    pub session_cpu_excl_self_s: f64,
+    /// RAPL/battery around the frame test; null when unreadable
+    pub psys_w: Option<f64>,
+    pub pkg_w: Option<f64>,
+    pub batt_w: Option<f64>,
     pub threads: Vec<ThreadShare>,
 }
 
@@ -131,6 +158,10 @@ pub struct PeakPhase {
     /// peak, and a missing average is not a zero.
     pub cpu_avg_pct: Option<f64>,
     pub cpu_peak_pct: f64,
+    /// 100 ms session CPU timeline, written only with `--json`
+    pub cpu_series: Option<Vec<CpuPoint>>,
+    /// phase boundaries for the timeline
+    pub cpu_marks: Option<Vec<CpuMark>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -160,6 +191,8 @@ pub struct Run {
     pub desktop_env: String,
     pub cgroup: String,
     pub cgroup_exact: bool,
+    /// "on" or "off": whether the window used the compositor's blur
+    pub blur: String,
     /// high / medium / low, derived from `checks`
     pub confidence: String,
     pub checks: Vec<Check>,
@@ -173,12 +206,26 @@ pub struct Run {
     pub peaks: Option<PeakPhase>,
 }
 
+/// Where automatic runs land: `$XDG_STATE_HOME/wayland-compositor-bench/results`
+/// (usually `~/.local/state/...`), not the working directory. A menu launch has
+/// no useful CWD; `--report` searches `./results` as well, so runs made from the
+/// repository keep working.
+pub fn results_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        });
+    base.join("wayland-compositor-bench").join("results")
+}
+
 impl Run {
     /// Writes the run and returns the path it landed on.
     pub fn write(&self, target: &JsonTarget) -> std::io::Result<PathBuf> {
         let path = match target {
             JsonTarget::Path(p) => p.clone(),
-            JsonTarget::Auto => Path::new("results").join(format!(
+            JsonTarget::Auto => results_dir().join(format!(
                 "{}-{}.json",
                 crate::cli::slug(&self.label),
                 stamp()
@@ -189,7 +236,9 @@ impl Run {
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut text = serde_json::to_string_pretty(self).unwrap_or_default();
+        // A serialization failure must not leave an empty file that looks like
+        // a successful run: propagate it so `--run` can exit non-zero.
+        let mut text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         text.push('\n');
         fs::write(&path, text)?;
         Ok(path)
@@ -289,6 +338,13 @@ struct Phase {
     sort_by: &'static str,
 }
 
+struct TableRow {
+    label: String,
+    cells: Vec<String>,
+    runs: usize,
+    sort_key: f64,
+}
+
 const IDLE: Phase = Phase {
     key: "idle",
     title: "idle session",
@@ -300,6 +356,7 @@ const IDLE: Phase = Phase {
         ("procs", "procs", 0),
         ("cpu_pct", "CPU %", 2),
         ("comp_cpu_pct", "comp CPU %", 2),
+        ("other_cpu_pct", "other CPU %", 2),
         ("wakeups_per_s", "wakeups/s", 0),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
@@ -330,6 +387,8 @@ const RENDER: Phase = Phase {
         ("cadence_hz", "cadence Hz", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
         ("gpu_ms_per_frame", "gpu ms/frame", 3),
+        ("psys_w", "psys W", 2),
+        ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
         ("dropped", "dropped", 0),
         ("frames", "frames", 0),
@@ -345,6 +404,8 @@ const MULTI: Phase = Phase {
         ("cadence_hz", "cadence Hz", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
         ("gpu_ms_per_frame", "gpu ms/frame", 3),
+        ("psys_w", "psys W", 2),
+        ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
         ("dropped", "dropped", 0),
         ("frames", "frames", 0),
@@ -363,33 +424,98 @@ const PEAKS: Phase = Phase {
     sort_by: "ram_peak_mib",
 };
 
-fn phase_value(run: &Run, key: &str) -> Option<serde_json::Value> {
+fn has_phase(run: &Run, key: &str) -> bool {
     match key {
-        "idle" => serde_json::to_value(run.idle.as_ref()?).ok(),
-        "windows" => serde_json::to_value(run.windows.as_ref()?).ok(),
-        "render" => serde_json::to_value(run.render.as_ref()?).ok(),
-        "multi" => serde_json::to_value(run.multi.as_ref()?).ok(),
-        "peaks" => serde_json::to_value(run.peaks.as_ref()?).ok(),
-        _ => None,
+        "idle" => run.idle.is_some(),
+        "windows" => run.windows.is_some(),
+        "render" => run.render.is_some(),
+        "multi" => run.multi.is_some(),
+        "peaks" => run.peaks.is_some(),
+        _ => false,
     }
 }
 
+/// Typed field access. The old version serialized the whole phase to a
+/// `serde_json::Value` for every column of every run, then parsed it back.
 fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
-    phase_value(run, phase.key)?.get(field)?.as_f64()
+    match phase.key {
+        "idle" => {
+            let p = run.idle.as_ref()?;
+            Some(match field {
+                "mem_mib" => p.mem_mib,
+                "peak_mib" => p.peak_mib,
+                "anon_mib" => p.anon_mib,
+                "comp_pss_mib" => p.comp_pss_mib,
+                "procs" => p.procs as f64,
+                "cpu_pct" => p.cpu_pct,
+                "comp_cpu_pct" => p.comp_cpu_pct,
+                "other_cpu_pct" => p.other_cpu_pct,
+                "wakeups_per_s" => p.wakeups_per_s,
+                "psys_w" => p.psys_w?,
+                "batt_w" => p.batt_w?,
+                _ => return None,
+            })
+        }
+        "windows" => {
+            let p = run.windows.as_ref()?;
+            Some(match field {
+                "per_window_mib" => p.per_window_mib,
+                "delta_mib" => p.delta_mib,
+                "client_gpu_mib" => p.client_gpu_mib,
+                "comp_delta_mib" => p.comp_delta_mib,
+                "comp_gpu_mib" => p.comp_gpu_mib,
+                "residual_mib" => p.residual_mib,
+                "extra" => f64::from(p.extra),
+                _ => return None,
+            })
+        }
+        "render" | "multi" => {
+            let p = if phase.key == "render" {
+                run.render.as_ref()?
+            } else {
+                run.multi.as_ref()?
+            };
+            Some(match field {
+                "fps" => p.fps,
+                "cadence_hz" => p.cadence_hz,
+                "comp_ms_per_frame" => p.comp_ms_per_frame,
+                "gpu_ms_per_frame" => p.gpu_ms_per_frame?,
+                "p95_ms" => p.p95_ms,
+                "dropped" => p.dropped as f64,
+                "frames" => p.frames as f64,
+                "psys_w" => p.psys_w?,
+                "batt_w" => p.batt_w?,
+                _ => return None,
+            })
+        }
+        "peaks" => {
+            let p = run.peaks.as_ref()?;
+            Some(match field {
+                "ram_peak_mib" => p.ram_peak_mib,
+                "cpu_avg_pct" => p.cpu_avg_pct?,
+                "cpu_peak_pct" => p.cpu_peak_pct,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn field_stats(runs: &[&Run], phase: &Phase, field: &str) -> Option<Stats> {
     stats(runs.iter().filter_map(|r| cell(r, phase, field)).collect())
 }
 
-/// Collects result files from directories, explicit files, and label filters.
-fn collect(targets: &[PathBuf]) -> Vec<PathBuf> {
+/// Collects result files from directories and explicit files, plus the label
+/// filters that need a parsed run to match. With no targets, both the working
+/// directory's `results/` and the XDG state directory are searched.
+fn collect(targets: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
     let mut files = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut filters: Vec<String> = Vec::new();
 
     if targets.is_empty() {
         dirs.push(PathBuf::from("results"));
+        dirs.push(results_dir());
     }
     for t in targets {
         if t.is_dir() {
@@ -402,6 +528,7 @@ fn collect(targets: &[PathBuf]) -> Vec<PathBuf> {
     }
     if !filters.is_empty() && dirs.is_empty() {
         dirs.push(PathBuf::from("results"));
+        dirs.push(results_dir());
     }
 
     for dir in &dirs {
@@ -414,28 +541,50 @@ fn collect(targets: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
 
-    if !filters.is_empty() {
-        files.retain(|f| {
-            let s = f.to_string_lossy().to_lowercase();
-            filters.iter().any(|w| s.contains(&w.to_lowercase()))
-        });
-    }
-
     files.sort();
     files.dedup();
-    files
+    (files, filters)
 }
 
 type Labeled = BTreeMap<String, Vec<Run>>;
 
+fn label_of(run: &Run, file: &Path) -> String {
+    if run.label.is_empty() {
+        file.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        run.label.clone()
+    }
+}
+
 fn load(targets: &[PathBuf]) -> Result<(Labeled, usize), String> {
-    let files = collect(targets);
+    let (files, filters) = collect(targets);
     if files.is_empty() {
         return Err(
-            "no results/*.json yet — run `wayland-compositor-bench --run --json` inside each session first"
+            "no saved runs yet — run `wayland-compositor-bench --run --json` inside each session first"
                 .into(),
         );
     }
+    // `--report`/`--compare` promise label substrings. A path filter still
+    // works as a fallback, which is what the old implementation did for both.
+    let selected = |label: &str, file: &Path| -> bool {
+        filters.is_empty()
+            || filters.iter().any(|f| {
+                let f = f.to_lowercase();
+                label.to_lowercase().contains(&f)
+                    || file.to_string_lossy().to_lowercase().contains(&f)
+            })
+    };
+    let path_selected = |file: &Path| -> bool {
+        filters.is_empty()
+            || filters.iter().any(|f| {
+                file.to_string_lossy()
+                    .to_lowercase()
+                    .contains(&f.to_lowercase())
+            })
+    };
+
     let mut runs: Labeled = BTreeMap::new();
     let mut skipped = 0;
     for file in &files {
@@ -444,26 +593,27 @@ fn load(targets: &[PathBuf]) -> Result<(Labeled, usize), String> {
             // Older schemas measured different things under the same names
             // (RAM used to include page cache), so they are not comparable.
             Ok(run) if run.schema_version != SCHEMA_VERSION => {
-                eprintln!(
-                    "ignoring {}: schema v{} (this build reads v{SCHEMA_VERSION})",
-                    file.display(),
-                    run.schema_version
-                );
-                skipped += 1;
+                if selected(&label_of(&run, file), file) {
+                    eprintln!(
+                        "ignoring {}: schema v{} (this build reads v{SCHEMA_VERSION})",
+                        file.display(),
+                        run.schema_version
+                    );
+                    skipped += 1;
+                }
             }
             Ok(run) => {
-                let label = if run.label.is_empty() {
-                    file.file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                } else {
-                    run.label.clone()
-                };
+                let label = label_of(&run, file);
+                if !selected(&label, file) {
+                    continue;
+                }
                 runs.entry(label).or_default().push(run);
             }
             Err(e) => {
-                eprintln!("skipping {}: {e}", file.display());
-                skipped += 1;
+                if path_selected(file) {
+                    eprintln!("skipping {}: {e}", file.display());
+                    skipped += 1;
+                }
             }
         }
     }
@@ -474,11 +624,7 @@ fn load(targets: &[PathBuf]) -> Result<(Labeled, usize), String> {
 pub fn print(targets: &[PathBuf]) -> Result<(), String> {
     let (runs, skipped) = load(targets)?;
 
-    let has = |p: &Phase, set: &Labeled| {
-        set.values()
-            .flatten()
-            .any(|r| phase_value(r, p.key).is_some())
-    };
+    let has = |p: &Phase, set: &Labeled| set.values().flatten().any(|r| has_phase(r, p.key));
     let mut phases = vec![IDLE, WINDOWS];
     if has(&RENDER, &runs) {
         phases.push(RENDER);
@@ -491,42 +637,41 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
     }
 
     for phase in &phases {
-        let mut rows: Vec<(String, Vec<String>, usize)> = Vec::new();
+        let mut rows: Vec<TableRow> = Vec::new();
         for (label, list) in &runs {
-            let list: Vec<&Run> = list
-                .iter()
-                .filter(|r| phase_value(r, phase.key).is_some())
-                .collect();
+            let list: Vec<&Run> = list.iter().filter(|r| has_phase(r, phase.key)).collect();
             if list.is_empty() {
                 continue;
             }
+            let mut sort_key = f64::MAX;
             let cells = phase
                 .columns
                 .iter()
                 .map(|(field, _, nd)| match field_stats(&list, phase, field) {
-                    Some(s) => fmt_value(&s, *nd),
+                    Some(s) => {
+                        if *field == phase.sort_by {
+                            sort_key = s.median;
+                        }
+                        fmt_value(&s, *nd)
+                    }
                     None => "-".into(),
                 })
                 .collect();
-            rows.push((label.clone(), cells, list.len()));
+            rows.push(TableRow {
+                label: label.clone(),
+                cells,
+                runs: list.len(),
+                sort_key,
+            });
         }
         if rows.is_empty() {
             continue;
         }
-        let sort_idx = phase
-            .columns
-            .iter()
-            .position(|(f, _, _)| *f == phase.sort_by)
-            .unwrap_or(0);
+        // Numeric key kept while the row is built: parsing the formatted cell
+        // back into a float breaks the moment a format gains a suffix.
         rows.sort_by(|a, b| {
-            let key = |r: &(String, Vec<String>, usize)| {
-                r.1.get(sort_idx)
-                    .and_then(|s| s.split_whitespace().next())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(f64::MAX)
-            };
-            key(a)
-                .partial_cmp(&key(b))
+            a.sort_key
+                .partial_cmp(&b.sort_key)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -546,8 +691,13 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
             .compositor_version
             .clone()
             .unwrap_or_else(|| r.compositor.clone());
+        let blur = match r.blur.as_str() {
+            "on" => " · blur on",
+            "off" => " · blur off",
+            _ => "",
+        };
         println!(
-            "  {label:<16} {version} · {} · {} run(s) · confidence {}",
+            "  {label:<16} {version} · {} · {} run(s) · confidence {}{blur}",
             if r.desktop.is_empty() {
                 "?"
             } else {
@@ -560,6 +710,24 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
                 &r.confidence
             }
         );
+        // The README promises `--report` prints what downgraded a run. The
+        // confidence string alone does not say which check failed.
+        let mut failures: Vec<String> = Vec::new();
+        for run in list {
+            for c in run.checks.iter().filter(|c| !c.ok) {
+                let text = if c.detail.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("{}: {}", c.name, c.detail)
+                };
+                if !failures.contains(&text) {
+                    failures.push(text);
+                }
+            }
+        }
+        if !failures.is_empty() {
+            println!("    checks: {}", failures.join("; "));
+        }
     }
 
     let mut warnings = Vec::new();
@@ -576,6 +744,21 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
                 break;
             }
         }
+        let blur = |r: &Run| {
+            if r.blur.is_empty() {
+                "unrecorded".to_string()
+            } else {
+                r.blur.clone()
+            }
+        };
+        let first_blur = blur(&list[0]);
+        if let Some(other) = list.iter().skip(1).find(|r| blur(r) != first_blur) {
+            warnings.push(format!(
+                "{label}: blur was {first_blur} in one run and {} in another — the chip state \
+                 changes what the compositor is asked to do",
+                blur(other)
+            ));
+        }
         if list.iter().any(|r| !r.cgroup_exact && !r.cgroup.is_empty()) {
             warnings.push(format!(
                 "{label}: measured a user slice, not a session scope (other sessions included)"
@@ -583,7 +766,8 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
         }
         if list.iter().any(|r| !r.clean) {
             warnings.push(format!(
-                "{label}: a run had >150 MiB of unrelated processes"
+                "{label}: a run had >{} MiB of unrelated processes",
+                sysinfo::CONTAMINANT_MIB as u32
             ));
         }
         if list
@@ -681,22 +865,21 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
     }
 
     let mut phases = vec![IDLE, WINDOWS];
-    let has = |p: &Phase, list: &[Run]| list.iter().any(|r| phase_value(r, p.key).is_some());
+    let has = |p: &Phase, list: &[Run]| list.iter().any(|r| has_phase(r, p.key));
     if has(&RENDER, &ra) || has(&RENDER, &rb) {
         phases.push(RENDER);
     }
     if has(&MULTI, &ra) || has(&MULTI, &rb) {
         phases.push(MULTI);
     }
+    if has(&PEAKS, &ra) || has(&PEAKS, &rb) {
+        phases.push(PEAKS);
+    }
 
     for phase in &phases {
         let (la, lb): (Vec<&Run>, Vec<&Run>) = (
-            ra.iter()
-                .filter(|r| phase_value(r, phase.key).is_some())
-                .collect(),
-            rb.iter()
-                .filter(|r| phase_value(r, phase.key).is_some())
-                .collect(),
+            ra.iter().filter(|r| has_phase(r, phase.key)).collect(),
+            rb.iter().filter(|r| has_phase(r, phase.key)).collect(),
         );
         if la.is_empty() && lb.is_empty() {
             continue;
@@ -737,13 +920,13 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_table(header: &[String], rows: &[(String, Vec<String>, usize)]) {
+fn print_table(header: &[String], rows: &[TableRow]) {
     let mut table: Vec<Vec<String>> = Vec::with_capacity(rows.len());
-    for (label, cells, n) in rows {
-        let mut row = vec![label.clone()];
-        row.extend(cells.iter().cloned());
-        row.push(n.to_string());
-        table.push(row);
+    for row in rows {
+        let mut cells = vec![row.label.clone()];
+        cells.extend(row.cells.iter().cloned());
+        cells.push(row.runs.to_string());
+        table.push(cells);
     }
 
     let mut width: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();

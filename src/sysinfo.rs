@@ -3,10 +3,16 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::proc;
+
+/// A process holding this much PSS makes a run incomparable: it competes for
+/// RAM and, usually, CPU. One constant so `--check`, the run and `--report`
+/// cannot disagree about what "clean" means.
+pub const CONTAMINANT_MIB: f64 = 150.0;
 
 pub fn read(path: &str) -> Option<String> {
     proc::read(path)
@@ -24,6 +30,8 @@ pub struct Snapshot {
     pub kernel_mib: f64,
     pub swap_mib: f64,
     pub cpu_usec: u64,
+    /// this process's own CPU time: the benchmark lives in the cgroup it measures
+    pub self_ns: u64,
     pub comp_ns: u64,
     /// compositor threads with their nanosecond CPU time, at sample time
     pub comp_tasks: Vec<proc::Task>,
@@ -42,6 +50,31 @@ impl Snapshot {
 
     pub fn take(comp_pid: Option<u32>) -> Self {
         let dir = proc::session_cgroup();
+        // Cheap counters first: the scans below are the benchmark's own work
+        // and must not fall inside the interval this snapshot measures.
+        let cpu_usec = proc::cpu_usage_usec(dir);
+        let self_ns = proc::cpu_ns(std::process::id());
+        // One thread scan: `comp_ns` is the sum of the tasks we already have.
+        let comp_tasks = comp_pid.map(proc::tasks).unwrap_or_default();
+        let comp_ns = comp_tasks.iter().map(|t| t.ns).sum();
+        let comp_wakeups = comp_pid.map(|p| proc::status(p).wakeups).unwrap_or(0);
+        let mut snap = Self::take_light();
+        snap.cpu_usec = cpu_usec;
+        snap.self_ns = self_ns;
+        snap.comp_ns = comp_ns;
+        snap.comp_tasks = comp_tasks;
+        snap.comp_wakeups = comp_wakeups;
+        snap.procs = proc::pids_in_cgroup(dir).len();
+        snap.comp_pss_mib = comp_pid
+            .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
+            .unwrap_or(0.0);
+        snap
+    }
+
+    /// The cgroup counters the 1 s live labels need, without the `/proc` walk
+    /// and `smaps_rollup` that make `take` expensive.
+    pub fn take_light() -> Self {
+        let dir = proc::session_cgroup();
         let m = proc::mem_stat(dir);
         Self {
             total_mib: proc::read_u64(dir.join("memory.current").to_string_lossy().as_ref())
@@ -55,13 +88,7 @@ impl Snapshot {
                 .unwrap_or(0) as f64
                 / 1048576.0,
             cpu_usec: proc::cpu_usage_usec(dir),
-            comp_ns: comp_pid.map(proc::cpu_ns).unwrap_or(0),
-            comp_tasks: comp_pid.map(proc::tasks).unwrap_or_default(),
-            comp_wakeups: comp_pid.map(proc::wakeups).unwrap_or(0),
-            procs: proc::pids_in_cgroup(dir).len(),
-            comp_pss_mib: comp_pid
-                .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
-                .unwrap_or(0.0),
+            ..Default::default()
         }
     }
 
@@ -74,6 +101,14 @@ impl Snapshot {
         let comp = after.comp_ns.saturating_sub(self.comp_ns) as f64 / 1e9 / seconds * 100.0;
         (cpu, comp)
     }
+
+    /// CPU % of one core spent by this process itself over the same window.
+    pub fn delta_self_cpu(&self, after: &Snapshot, seconds: f64) -> f64 {
+        if seconds <= 0.0 {
+            return 0.0;
+        }
+        after.self_ns.saturating_sub(self.self_ns) as f64 / 1e9 / seconds * 100.0
+    }
 }
 
 /// Processes big enough to make a run incomparable, excluding the compositor and
@@ -85,7 +120,7 @@ pub fn contaminants(exclude: &[u32]) -> Vec<(String, f64)> {
             continue;
         }
         let mib = proc::pss_kb(pid) as f64 / 1024.0;
-        if mib >= 150.0 {
+        if mib >= CONTAMINANT_MIB {
             out.push((proc::comm(pid).unwrap_or_else(|| format!("pid {pid}")), mib));
         }
     }
@@ -422,42 +457,53 @@ pub struct GpuInfo {
 /// Human name for a PCI id from the pci.ids database. Distros disagree on
 /// where it lives: hwdata on Arch/Fedora, misc on Debian, pciutils elsewhere.
 /// Falls back to the bare id: a wrong name is worse than none.
+///
+/// The file is ~1.6 MB and was re-scanned per card, twice per start. Parse it
+/// once into a map of the ids it actually contains.
 fn pci_name(id: &str) -> Option<String> {
-    let (vendor, device) = id.split_once(':')?;
-    for path in [
-        "/usr/share/hwdata/pci.ids",
-        "/usr/share/misc/pci.ids",
-        "/usr/share/pci.ids",
-        "/var/lib/pciutils/pci.ids",
-    ] {
-        let Ok(text) = fs::read_to_string(path) else {
-            continue;
-        };
-        let mut in_vendor = false;
-        for line in text.lines() {
-            if line.starts_with('#') || line.trim().is_empty() {
+    static IDS: OnceLock<Option<HashMap<(String, String), String>>> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        for path in [
+            "/usr/share/hwdata/pci.ids",
+            "/usr/share/misc/pci.ids",
+            "/usr/share/pci.ids",
+            "/var/lib/pciutils/pci.ids",
+        ] {
+            let Ok(text) = fs::read_to_string(path) else {
                 continue;
-            }
-            if !line.starts_with('\t') {
-                let Some(v) = line.split_whitespace().next() else {
+            };
+            let mut map = HashMap::new();
+            let mut vendor = String::new();
+            for line in text.lines() {
+                if line.starts_with('#') || line.trim().is_empty() {
                     continue;
-                };
-                in_vendor = v.eq_ignore_ascii_case(vendor);
-                continue;
-            }
-            if in_vendor && !line.starts_with("\t\t") {
+                }
+                if !line.starts_with('\t') {
+                    vendor = line
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    continue;
+                }
+                if line.starts_with("\t\t") || vendor.is_empty() {
+                    continue;
+                }
                 let mut it = line.trim_start().splitn(2, char::is_whitespace);
                 let Some(dev) = it.next() else { continue };
-                if dev.eq_ignore_ascii_case(device) {
-                    let name = it.next().unwrap_or("").trim();
-                    if !name.is_empty() {
-                        return Some(name.to_string());
-                    }
+                let name = it.next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    map.insert((vendor.clone(), dev.to_ascii_lowercase()), name.to_string());
                 }
             }
+            return Some(map);
         }
-    }
-    None
+        None
+    });
+    let (vendor, device) = id.split_once(':')?;
+    ids.as_ref()?
+        .get(&(vendor.to_ascii_lowercase(), device.to_ascii_lowercase()))
+        .cloned()
 }
 
 fn pci_vendor_name(id: &str) -> Option<&'static str> {

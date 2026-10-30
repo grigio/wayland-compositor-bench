@@ -10,10 +10,10 @@
 //!   socket, not "the oldest process with a known name". Nested compositors and
 //!   multi-seat setups make the name heuristic pick the wrong process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub fn read(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
@@ -249,9 +249,10 @@ pub fn pss_tree(pid: u32) -> (u64, Vec<u32>) {
     }
     let mut total = 0;
     let mut seen = Vec::new();
+    let mut visited = HashSet::new();
     let mut queue = vec![pid];
     while let Some(p) = queue.pop() {
-        if seen.contains(&p) {
+        if !visited.insert(p) {
             continue;
         }
         seen.push(p);
@@ -263,29 +264,89 @@ pub fn pss_tree(pid: u32) -> (u64, Vec<u32>) {
     (total, seen)
 }
 
-/// `voluntary` + `nonvoluntary` context switches: a wakeup proxy that costs one
-/// file read.
-pub fn wakeups(pid: u32) -> u64 {
-    read(&format!("/proc/{pid}/status"))
-        .map(|s| {
-            s.lines()
-                .filter(|l| {
-                    l.starts_with("voluntary_ctxt_switches") || l.starts_with("nonvoluntary")
-                })
-                .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-                .sum()
-        })
-        .unwrap_or(0)
+/// Context switches and thread count from one read of `/proc/<pid>/status`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcStatus {
+    pub wakeups: u64,
+    pub threads: u32,
 }
 
-pub fn threads(pid: u32) -> u32 {
-    read(&format!("/proc/{pid}/status"))
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Threads:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+pub fn status(pid: u32) -> ProcStatus {
+    let Some(s) = read(&format!("/proc/{pid}/status")) else {
+        return ProcStatus::default();
+    };
+    let mut out = ProcStatus::default();
+    for line in s.lines() {
+        if line.starts_with("voluntary_ctxt_switches")
+            || line.starts_with("nonvoluntary_ctxt_switches")
+        {
+            if let Some(v) = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                out.wakeups += v;
+            }
+        } else if line.starts_with("Threads:") {
+            out.threads = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    out
+}
+
+/// CPU time of one process in nanoseconds, from `utime + stime` in
+/// `/proc/<pid>/stat`. Coarser than `schedstat` (10 ms ticks) but one file per
+/// process, which is what a whole-`/proc` attribution pass needs.
+pub fn cpu_time_ns(pid: u32) -> Option<u64> {
+    let s = read(&format!("/proc/{pid}/stat"))?;
+    let close = s.rfind(')')?;
+    let mut it = s[close + 1..].split_whitespace();
+    let utime: u64 = it.nth(11)?.parse().ok()?;
+    let stime: u64 = it.next()?.parse().ok()?;
+    Some((utime + stime) * 1_000_000_000 / clock_ticks())
+}
+
+fn clock_ticks() -> u64 {
+    static TICKS: OnceLock<u64> = OnceLock::new();
+    *TICKS.get_or_init(|| {
+        extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        const SC_CLK_TCK: i32 = 2;
+        let v = unsafe { sysconf(SC_CLK_TCK) };
+        if v > 0 {
+            v as u64
+        } else {
+            100
+        }
+    })
+}
+
+/// The session's CPU counters at one instant: the cgroup total plus per-process
+/// `utime + stime`, so a run can name what used the CPU besides the compositor.
+#[derive(Clone, Debug, Default)]
+pub struct CpuSnapshot {
+    pub total_usec: u64,
+    /// (pid, comm, CPU ns) for every process in the session cgroup
+    pub procs: Vec<(u32, String, u64)>,
+}
+
+pub fn cpu_snapshot() -> CpuSnapshot {
+    let dir = session_cgroup();
+    let total_usec = cpu_usage_usec(dir);
+    let procs = pids_in_cgroup(dir)
+        .into_iter()
+        .filter_map(|pid| {
+            let ns = cpu_time_ns(pid)?;
+            let name = comm(pid).unwrap_or_else(|| format!("pid {pid}"));
+            Some((pid, name, ns))
         })
-        .unwrap_or(0)
+        .collect();
+    CpuSnapshot { total_usec, procs }
 }
 
 // ------------------------------------------------------------------- gpu ---
@@ -647,7 +708,25 @@ fn name_compositor() -> Option<Compositor> {
 /// but one that ignores the flag would start a nested session and never
 /// return, so the child is killed after two seconds instead of blocking the
 /// window that is about to open.
+///
+/// The window and the run both ask for the same line, so the answer is cached:
+/// spawning a compositor binary twice per start is unnecessary.
 pub fn compositor_version(name: &str) -> Option<String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some(v) = c.get(name) {
+            return v.clone();
+        }
+    }
+    let version = compositor_version_uncached(name);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(name.to_string(), version.clone());
+    }
+    version
+}
+
+fn compositor_version_uncached(name: &str) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};

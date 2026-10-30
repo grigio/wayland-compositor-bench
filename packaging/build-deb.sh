@@ -46,6 +46,11 @@ install -Dm644 README.md "$stage/usr/share/doc/$pkg/README.md"
 gzip -9n -c CHANGELOG.md > "$stage/usr/share/doc/$pkg/changelog.gz"
 chmod 644 "$stage/usr/share/doc/$pkg/changelog.gz"
 
+install -Dm644 packaging/wayland-compositor-bench.desktop \
+  "$stage/usr/share/applications/wayland-compositor-bench.desktop"
+install -Dm644 packaging/wayland-compositor-bench.svg \
+  "$stage/usr/share/icons/hicolor/scalable/apps/wayland-compositor-bench.svg"
+
 # A Debian copyright file, not a copy of the GPL: lintian rejects shipping
 # the full licence text when /usr/share/common-licenses already has it.
 cat > "$stage/usr/share/doc/$pkg/copyright" <<EOF
@@ -92,6 +97,7 @@ Architecture: $arch
 Maintainer: grigio <grigio@users.noreply.github.com>
 Installed-Size: $installed_size
 Depends: libc6 (>= $libc_version), libgtk-4-1 (>= $gtk_floor), libwayland-client0
+Recommends: desktop-file-utils, hicolor-icon-theme
 Homepage: https://github.com/grigio/$pkg
 Description: measure the memory, CPU and power cost of a Wayland session
  A single Rust binary that measures the Wayland session you are logged into:

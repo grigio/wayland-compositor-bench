@@ -5,6 +5,7 @@ on:
     branches: [main, master]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +46,8 @@ jobs:
 
       - uses: actions/checkout@v5
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -63,6 +66,46 @@ jobs:
         with:
           name: wayland-compositor-bench-linux-x86_64
           path: target/release/wayland-compositor-bench
+
+  msrv:
+    # Keep the declared floor honest: gtk4-rs moves its own MSRV, so a
+    # dependency bump can silently raise ours.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev pkg-config
+
+      - name: Read the MSRV from Cargo.toml
+        id: msrv
+        run: |
+          VERSION=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ -n "$VERSION" ] || { echo "rust-version not found"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on the declared MSRV
+        run: cargo check --all-targets --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   package:
     if: startsWith(github.ref, 'refs/tags/')
@@ -113,6 +156,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain "$RUST"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build Debian package
         run: ./packaging/build-deb.sh

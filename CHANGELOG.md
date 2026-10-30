@@ -4,7 +4,7 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] — 2026-10-30
 
 ### Added
 
@@ -22,6 +22,19 @@ All notable changes to this project. The format follows
   children into one stripe instead of a dozen. Clicking a stripe dims the others
   and highlights that name's tag; clicking the same stripe again clears it. The
   window is taller to hold it.
+- A `quiet cpu` check and an `other CPU` figure: session CPU that is neither the
+  compositor nor this tool is reported as `idle.other_cpu_pct`; above 5 % the
+  check fails and names the busiest processes seen while the session settles.
+  The `idle` table in `--report` gained an `other CPU %` column.
+- Every JSON run records the blur chip state (`blur`), package and battery power
+  around each frame test, the benchmark's own CPU share (`self_cpu_s`) and the
+  session figure with it subtracted (`session_cpu_excl_self_s`). With `--json`,
+  `peaks.cpu_series` and `peaks.cpu_marks` also keep the 100 ms CPU timeline and
+  its phase boundaries.
+- `--check` prints the actual `--idle`, `--settle`, `--frames` and `--windows`
+  values instead of hardcoded defaults, and exits 2 when the session is
+  measurable only with caveats.
+- Both packages install the `.desktop` launcher and the hicolor SVG icon.
 
 ### Changed
 
@@ -40,6 +53,44 @@ All notable changes to this project. The format follows
   standalone compositor that is its own desktop (`sway`, `labwc`) is not named
   twice. `--check` prints the identical string, so the terminal and the window
   cannot disagree about what the session is.
+- Automatic runs are written under
+  `$XDG_STATE_HOME/wayland-compositor-bench/results` (usually
+  `~/.local/state/...`) instead of the working directory. `--report` and
+  `--compare` read that directory and `./results`, and match label substrings
+  before falling back to file paths. `--compare` now includes the `peaks` phase,
+  and `--report` prints the failing checks behind a `medium`/`low` confidence.
+- RAPL domains and readability are cached, power is sampled outside the CPU
+  windows, and `WG_BENCH_NO_SUDO=1` disables the non-interactive `sudo -n`
+  fallback. The README now says when the tool escalates instead of claiming it
+  never needs root.
+- The 1 s live updater reads only the cheap cgroup counters every second and
+  refreshes PSS, GPU memory, pressure and package temperature every fifth tick.
+  `pci.ids`, the RAPL domains and `compositor_version` are parsed once.
+- CI caches the Rust build, runs an MSRV job pinned to `rust-version`, runs
+  `cargo audit`, and can be dispatched manually.
+- The schema stays at v3: every new field is optional or defaulted, so results
+  written by 0.3.x still load and compare.
+
+### Fixed
+
+- `Session CPU` seeded its first tick with zero, so it reported the cumulative
+  time since boot; after a run it reported the run's average as idle. It now
+  seeds from the live cgroup counter and re-baselines when a run starts or ends.
+- `--run` exits non-zero when the JSON cannot be written instead of leaving an
+  empty file and reporting success.
+- `mean_cpu` used the following interval to weight each sample, dropping the
+  last real sample; it now uses the trapezoid rule.
+- The sampler's settle/run reset could leak one pre-run interval into the new
+  timeline. The baseline lives in the shared series now, so `reset` and the
+  sampling thread cannot disagree.
+- `Probe` read the session counters after its own thread scans, charging part of
+  the probe to the measured window; counters are read first now, and the
+  compositor's threads are scanned once instead of twice.
+- `--report` filtered on file paths while `--compare` filtered on labels;
+  both parse the run and match its label first.
+- The report table sorts by a numeric key instead of re-parsing the formatted
+  cell, and field access is typed instead of round-tripping every phase through
+  JSON.
 
 ## [0.3.1] — 2026-10-29
 
