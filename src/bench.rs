@@ -33,6 +33,12 @@ use crate::wlscan;
 
 const WINDOW_SETTLE_MS: u64 = 3000;
 const CLOSE_SETTLE_MS: u64 = 1500;
+/// Time given to GTK's transient buffers to drain before the pre-open baseline,
+/// and again between the two baselines that detect drift.
+const WINDOW_BASELINE_SETTLE_MS: u64 = 1000;
+/// A baseline that moves more than this while idle makes the window delta
+/// meaningless, however small the delta itself is.
+const WINDOW_DRIFT_MIB: f64 = 5.0;
 /// Peak sampler period. 25 ms is fine enough to see a window-open spike and
 /// cheap enough (two small files per tick) to stay below 0.1 % CPU.
 const PEAK_PERIOD_MS: u64 = 25;
@@ -41,17 +47,24 @@ const PEAK_PERIOD_MS: u64 = 25;
 const QUIET_WINDOW_S: f64 = 2.0;
 
 pub struct Summary {
-    pub fps: f64,
-    pub target_hz: f64,
+    /// share of frames delivered at the observed cadence, one surface
+    pub pacing_single: f64,
+    /// the same with the extra toplevels open
+    pub pacing_multi: f64,
     pub ram_mib: f64,
     pub ram_peak_mib: f64,
     pub cpu_pct: f64,
-    pub cpu_avg_pct: f64,
+    /// compositor CPU at rest, % of one core
+    pub comp_cpu_pct: f64,
     pub cpu_peak_pct: f64,
-    /// session CPU that was neither the compositor nor this benchmark
+    /// session CPU outside the compositor process tree and this benchmark
     pub other_cpu_pct: f64,
     pub comp_mib: f64,
     pub comp_ms_per_frame: f64,
+    /// compositor CPU per frame in the load case (multi, else single)
+    pub comp_ms_per_frame_multi: f64,
+    /// cadence that test settled into: its period is the frame budget
+    pub cadence_hz_multi: f64,
     pub gpu_ms_per_frame: Option<f64>,
     pub feat_pct: f64,
     pub feat_supported: usize,
@@ -385,6 +398,9 @@ struct Probe {
     comp_ns: u64,
     tasks: Vec<proc::Task>,
     gpu: proc::Gpu,
+    /// this benchmark's own DRM client counters, so the frame test can report
+    /// both sides of the GPU work
+    app_gpu: proc::Gpu,
     session_usec: u64,
     app_ns: u64,
     at: Instant,
@@ -397,12 +413,14 @@ impl Probe {
         let tasks = pid.map(proc::tasks).unwrap_or_default();
         let comp_ns = tasks.iter().map(|t| t.ns).sum();
         let gpu = pid.map(proc::gpu).unwrap_or_default();
+        let app_gpu = proc::gpu(std::process::id());
         let session_usec = proc::cpu_usage_usec(proc::session_cgroup());
         let app_ns = proc::cpu_ns(std::process::id());
         Self {
             comp_ns,
             tasks,
             gpu,
+            app_gpu,
             session_usec,
             app_ns,
             at: Instant::now(),
@@ -418,10 +436,12 @@ impl Probe {
         let tasks = pid.map(proc::tasks).unwrap_or_default();
         let comp_ns = tasks.iter().map(|t| t.ns).sum();
         let gpu = pid.map(proc::gpu).unwrap_or_default();
+        let app_gpu = proc::gpu(std::process::id());
         Self {
             comp_ns,
             tasks,
             gpu,
+            app_gpu,
             session_usec,
             app_ns,
             at,
@@ -660,13 +680,15 @@ pub fn start(ui: BenchUi) {
 
 struct Settle {
     seconds: f64,
-    /// the busiest processes outside the compositor and this tool, largest first
-    top_cpu: Vec<(String, f64)>,
 }
 
 /// Session CPU split into "the thing being measured", "this tool" and
 /// "everything else". The last number is what turns an unexplained 46 % idle
 /// figure into a diagnosis.
+///
+/// A process that did not exist at the start of the window is skipped: its
+/// `/proc` CPU time is its whole lifetime, and charging that to this window is
+/// how a short-lived helper turns into a fake 30 % offender.
 fn cpu_attribution(
     before: &proc::CpuSnapshot,
     after: &proc::CpuSnapshot,
@@ -686,7 +708,10 @@ fn cpu_attribution(
     let mut excluded_pct = 0.0;
     let mut top: Vec<(String, f64)> = Vec::new();
     for (pid, name, ns) in &after.procs {
-        let delta = ns.saturating_sub(*before_ns.get(pid).unwrap_or(&0));
+        let Some(previous) = before_ns.get(pid) else {
+            continue;
+        };
+        let delta = ns.saturating_sub(*previous);
         let pct = delta as f64 / 1e9 / seconds * 100.0;
         if exclude.contains(pid) {
             excluded_pct += pct;
@@ -702,9 +727,8 @@ fn cpu_attribution(
 /// Wait until session CPU stops moving. Lazy portals and login animations land
 /// seconds after the window appears, so a fixed sleep is either too short or
 /// wasteful.
-async fn settle(ui: &BenchUi, max_s: f64, exclude: &[u32]) -> Settle {
+async fn settle(ui: &BenchUi, max_s: f64) -> Settle {
     let start = Instant::now();
-    let before = proc::cpu_snapshot();
     let mut windows: Vec<f64> = Vec::new();
     loop {
         let t0 = Instant::now();
@@ -733,9 +757,7 @@ async fn settle(ui: &BenchUi, max_s: f64, exclude: &[u32]) -> Settle {
         }
     }
     let seconds = start.elapsed().as_secs_f64();
-    let after = proc::cpu_snapshot();
-    let (_, top_cpu) = cpu_attribution(&before, &after, seconds, exclude);
-    Settle { seconds, top_cpu }
+    Settle { seconds }
 }
 
 async fn run(ui: BenchUi) {
@@ -849,7 +871,7 @@ async fn run(ui: BenchUi) {
     let sampler = Sampler::start();
 
     // ------------------------------------------------------------- idle ---
-    let settle = settle(&ui, opts.settle_s, &exclude).await;
+    let settle = settle(&ui, opts.settle_s).await;
     let settle_s = settle.seconds;
     sampler.reset();
     sampler.mark("idle");
@@ -858,18 +880,26 @@ async fn run(ui: BenchUi) {
         opts.idle_s
     ));
     ui.progress.set_fraction(0.25);
-    // Power is sampled outside the CPU window: on a root-only-RAPL machine the
-    // reading forks `sudo`, and that fork must not be charged to the session.
+    // `begin` scans first and reads the counters last; `end` reads the counters
+    // first and scans last. The scans are therefore outside the interval, and
+    // the power samples bracket only the sleep.
+    let i0 = Snapshot::begin(pid);
     let pw0 = power::sample();
-    let i0 = Snapshot::take(pid);
     glib::timeout_future(Duration::from_secs_f64(opts.idle_s)).await;
-    let i1 = Snapshot::take(pid);
     let pw1 = power::sample();
-    let (cpu_pct, comp_pct) = i0.delta_cpu(&i1, opts.idle_s);
-    let self_pct = i0.delta_self_cpu(&i1, opts.idle_s);
-    let other_cpu_pct = (cpu_pct - comp_pct - self_pct).max(0.0);
-    let wakeups = i1.comp_wakeups.saturating_sub(i0.comp_wakeups) as f64 / opts.idle_s;
-    let (psys_w, pkg_w) = power::delta(pw0, pw1, opts.idle_s);
+    let i1 = Snapshot::end(pid);
+    let idle_s = i1
+        .at
+        .saturating_duration_since(i0.at)
+        .as_secs_f64()
+        .max(1e-6);
+    let (cpu_pct, comp_pct) = i0.delta_cpu(&i1, idle_s);
+    // The offenders and the headline number come from the same idle window and
+    // the same exclusion set: compositor process tree plus this benchmark.
+    let (other_cpu_pct, top_cpu) =
+        cpu_attribution(&i0.cpu_snapshot(), &i1.cpu_snapshot(), idle_s, &exclude);
+    let wakeups = i1.comp_wakeups.saturating_sub(i0.comp_wakeups) as f64 / idle_s;
+    let (psys_w, pkg_w) = power::delta(pw0, pw1);
     let batt_status = batt
         .as_ref()
         .map(|(_, s)| s.clone())
@@ -882,8 +912,7 @@ async fn run(ui: BenchUi) {
         i1.comp_ns.saturating_sub(i0.comp_ns),
     );
 
-    let top_cpu = settle
-        .top_cpu
+    let top_cpu = top_cpu
         .iter()
         .map(|(name, pct)| format!("{name} {pct:.1}%"))
         .collect::<Vec<_>>()
@@ -892,9 +921,9 @@ async fn run(ui: BenchUi) {
         name: "quiet cpu".into(),
         ok: other_cpu_pct <= 5.0,
         detail: if top_cpu.is_empty() {
-            format!("{other_cpu_pct:.1}% outside the compositor and this tool")
+            format!("{other_cpu_pct:.1}% outside the compositor tree and this tool")
         } else {
-            format!("{other_cpu_pct:.1}% outside the compositor and this tool: {top_cpu}")
+            format!("{other_cpu_pct:.1}% outside the compositor tree and this tool: {top_cpu}")
         },
     });
 
@@ -964,21 +993,33 @@ async fn run(ui: BenchUi) {
     let n = opts.windows;
     ui.set_status(&format!("opening {n} toplevels…"));
     sampler.mark("+windows");
+    // The single-surface frame test leaves transient GTK buffers behind. Take
+    // two baselines a second apart: the second is the one used, and the
+    // difference says whether the idle session was still moving.
+    glib::timeout_future(Duration::from_millis(WINDOW_BASELINE_SETTLE_MS)).await;
+    let base0 = Snapshot::take(pid);
+    glib::timeout_future(Duration::from_millis(WINDOW_BASELINE_SETTLE_MS)).await;
     let base = Snapshot::take(pid);
+    let baseline_drift = base.working_set_mib() - base0.working_set_mib();
     let wins: Vec<TestWin> = (0..n).map(|i| test_window(&ui.app, i)).collect();
     glib::timeout_future(Duration::from_millis(WINDOW_SETTLE_MS)).await;
     let with_wins = Snapshot::take(pid);
     let with_gpu_self = proc::gpu(std::process::id());
     let with_gpu_comp = pid.map(proc::gpu).unwrap_or_default();
-    let delta = (with_wins.working_set_mib() - base.working_set_mib()).max(0.0);
-    let comp_delta = (with_wins.comp_pss_mib - base.comp_pss_mib).max(0.0);
+    // Keep the signed delta: a negative value means the session shrank, which
+    // is a measurement, not zero growth. The per-window figure is only written
+    // when the delta is non-negative and the baseline was stable.
+    let delta = with_wins.working_set_mib() - base.working_set_mib();
+    let comp_delta = with_wins.comp_pss_mib - base.comp_pss_mib;
+    let client_delta = delta - comp_delta;
+    let delta_valid = n > 0 && delta >= 0.0 && baseline_drift.abs() <= WINDOW_DRIFT_MIB;
+    let per_window = delta_valid.then(|| delta / f64::from(n));
     // Window buffers are dmabufs here: they never appear in the session cgroup,
     // and GTK keeps a large buffer pool, so the delta is ~0. Report what is
     // actually held instead of pretending a per-window GPU cost exists.
     // The compositor's number excludes the clients' buffers it imported.
     let client_gpu = with_gpu_self.resident as f64 / 1048576.0;
     let comp_gpu = with_gpu_comp.private as f64 / 1048576.0;
-    let per_window = delta / n.max(1) as f64;
 
     let extras: Vec<(gtk::DrawingArea, Rc<Cell<f64>>)> = wins
         .iter()
@@ -993,8 +1034,15 @@ async fn run(ui: BenchUi) {
         w.win.close();
     }
     drop(wins);
+    // Two post-close snapshots: the drift between them is the leak indicator,
+    // while the difference against the pre-open baseline is how much was never
+    // returned. They answer different questions and are reported separately.
+    glib::timeout_future(Duration::from_millis(CLOSE_SETTLE_MS)).await;
+    let post_close = Snapshot::take(pid);
     glib::timeout_future(Duration::from_millis(CLOSE_SETTLE_MS)).await;
     let after_close = Snapshot::take(pid);
+    let residual = after_close.working_set_mib() - base.working_set_mib();
+    let post_close_drift = after_close.working_set_mib() - post_close.working_set_mib();
 
     ui.section("memory");
     ui.add(
@@ -1002,17 +1050,23 @@ async fn run(ui: BenchUi) {
         &sysinfo::fmt_mib(base.working_set_mib()),
     );
     ui.add(
-        &format!("with {n} extra toplevels"),
+        "  baseline drift",
         &format!(
-            "{}  (+{:.0} MiB)",
-            sysinfo::fmt_mib(with_wins.working_set_mib()),
-            delta
+            "{baseline_drift:+.1} MiB over {:.1} s",
+            WINDOW_BASELINE_SETTLE_MS as f64 / 1000.0
         ),
     );
-    ui.add("  compositor share", &format!("+{comp_delta:.1} MiB"));
     ui.add(
-        "  client share",
-        &format!("+{:.1} MiB", (delta - comp_delta).max(0.0)),
+        &format!("with {n} extra toplevels"),
+        &format!(
+            "{}  ({delta:+.0} MiB)",
+            sysinfo::fmt_mib(with_wins.working_set_mib())
+        ),
+    );
+    ui.add("  compositor share", &format!("{comp_delta:+.1} MiB"));
+    ui.add(
+        "  client share (same process)",
+        &format!("{client_delta:+.1} MiB"),
     );
     ui.add(
         "GPU memory held",
@@ -1020,13 +1074,23 @@ async fn run(ui: BenchUi) {
             "client {client_gpu:.0} MiB · compositor {comp_gpu:.0} MiB (pooled, not per window)"
         ),
     );
-    ui.add("per extra toplevel", &format!("{per_window:.1} MiB"));
+    ui.add(
+        "per extra toplevel",
+        &match per_window {
+            Some(v) => format!("{v:.1} MiB"),
+            None if n == 0 => "not measured (no extra toplevels)".to_string(),
+            None => format!(
+                "not measured (delta {delta:+.1} MiB, baseline drift {baseline_drift:+.1} MiB)"
+            ),
+        },
+    );
     ui.add(
         "residual after close",
-        &format!(
-            "{:+.0} MiB",
-            after_close.working_set_mib() - base.working_set_mib()
-        ),
+        &format!("{residual:+.0} MiB vs. pre-open baseline"),
+    );
+    ui.add(
+        "post-close drift",
+        &format!("{post_close_drift:+.0} MiB between two post-close samples"),
     );
     ui.add(
         "what is counted",
@@ -1075,10 +1139,11 @@ async fn run(ui: BenchUi) {
         });
         checks.push(report::Check {
             name: "GPU counters".into(),
-            ok: r.gpu_ms_per_frame.is_some(),
-            detail: match r.gpu_ms_per_frame {
-                Some(_) => "DRM fdinfo".into(),
-                None => "not exposed by this driver".into(),
+            ok: r.gpu_ms_per_frame.is_some() || r.app_gpu_ms_per_frame.is_some(),
+            detail: if r.gpu_ms_per_frame.is_some() || r.app_gpu_ms_per_frame.is_some() {
+                "DRM fdinfo".into()
+            } else {
+                "not exposed by this driver".into()
             },
         });
     }
@@ -1087,24 +1152,41 @@ async fn run(ui: BenchUi) {
 
     // ------------------------------------------------------------ summary ---
     let scan = ui.scan.borrow();
+    let scan_ok = scan.as_ref().is_some_and(|s| s.connected);
     let globals = scan.as_ref().map(|s| s.globals.clone()).unwrap_or_default();
     let feats = wlscan::evaluate(&globals);
     drop(scan);
+    // A failed scan writes null, not 0 %: "not measured" and "advertised
+    // nothing" are different claims.
+    let features = scan_ok.then(|| report::Features::from_scan(&feats));
+
+    // Delivered frames are counted against the cadence the compositor actually
+    // settled into, so a clean 60 fps on a 120 Hz panel is 100 %, not 50 %.
+    let pacing_share = |r: &Option<report::RenderPhase>| {
+        r.as_ref()
+            .filter(|p| p.frames > 0)
+            .map(|p| ((p.frames - p.dropped) as f64 / p.frames as f64).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    };
+    let pacing_single = pacing_share(&single);
+    let pacing_multi = pacing_share(&multi);
+    // The multi-surface test is the load case; fall back to the single one
+    // when it produced too few frames to pace.
+    let load = multi.as_ref().or(single.as_ref());
 
     (ui.summary)(Summary {
-        fps: single.as_ref().map(|r| r.fps).unwrap_or(0.0),
-        target_hz: single
-            .as_ref()
-            .map(|r| r.target_hz)
-            .unwrap_or(ui.refresh_hz),
+        pacing_single,
+        pacing_multi,
         ram_mib: i1.working_set_mib(),
         ram_peak_mib: ram_peak,
         cpu_pct,
-        cpu_avg_pct: cpu_avg,
+        comp_cpu_pct: comp_pct,
         cpu_peak_pct: peak_cpu,
         other_cpu_pct,
         comp_mib,
         comp_ms_per_frame: single.as_ref().map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
+        comp_ms_per_frame_multi: load.map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
+        cadence_hz_multi: load.map(|r| r.cadence_hz).unwrap_or(0.0),
         gpu_ms_per_frame: single.as_ref().and_then(|r| r.gpu_ms_per_frame),
         feat_pct: feats.percent(),
         feat_supported: feats.supported,
@@ -1149,8 +1231,10 @@ async fn run(ui: BenchUi) {
                 })
                 .collect(),
             env,
+            features,
             idle: Some(report::IdlePhase {
                 dur_s: opts.idle_s,
+                measured_s: Some(idle_s),
                 settle_s,
                 mem_mib: i1.working_set_mib(),
                 total_mib: i1.total_mib,
@@ -1164,7 +1248,7 @@ async fn run(ui: BenchUi) {
                 procs: i1.procs,
                 cpu_pct,
                 comp_cpu_pct: comp_pct,
-                other_cpu_pct,
+                other_cpu_pct: Some(other_cpu_pct),
                 wakeups_per_s: wakeups,
                 comp_pss_mib: comp_mib,
                 psys_w,
@@ -1176,15 +1260,19 @@ async fn run(ui: BenchUi) {
             windows: Some(report::WindowsPhase {
                 extra: n,
                 settle_s: WINDOW_SETTLE_MS as f64 / 1000.0,
+                method: "same-process GTK toplevels".into(),
                 baseline_mib: base.working_set_mib(),
+                baseline_drift_mib: Some(baseline_drift),
                 with_windows_mib: with_wins.working_set_mib(),
                 delta_mib: delta,
+                delta_valid,
                 client_gpu_mib: client_gpu,
                 comp_gpu_mib: comp_gpu,
                 per_window_mib: per_window,
                 comp_delta_mib: comp_delta,
-                client_delta_mib: (delta - comp_delta).max(0.0),
-                residual_mib: after_close.working_set_mib() - base.working_set_mib(),
+                client_delta_mib: client_delta,
+                residual_mib: residual,
+                post_close_drift_mib: Some(post_close_drift),
             }),
             render: single,
             multi,
@@ -1294,14 +1382,14 @@ async fn frame_test(
         glib::ControlFlow::Continue
     });
 
-    // RAPL/battery brackets sit outside the CPU window: the frame test then
-    // answers "what does animating these surfaces cost in watts" without the
-    // reading itself landing in the session CPU delta.
-    let pw0 = power::sample();
+    // The probes bracket the CPU window; the power samples bracket only the
+    // sleep, so a slow `/proc` walk is not charged to the frame test and the
+    // RAPL reading itself is not mistaken for the test's cost.
     let before = Probe::before(pid);
+    let pw0 = power::sample();
     glib::timeout_future(Duration::from_secs_f64(dur_s)).await;
-    let after = Probe::after(pid);
     let pw1 = power::sample();
+    let after = Probe::after(pid);
     let batt_w = power::battery_watts();
     let wall = after.at.duration_since(before.at).as_secs_f64();
     tick.remove();
@@ -1317,17 +1405,28 @@ async fn frame_test(
     let comp_ns = after.comp_ns.saturating_sub(before.comp_ns);
     let comp_ms = comp_ns as f64 / 1e9 * 1000.0 / frames;
     let app_ms = after.app_ns.saturating_sub(before.app_ns) as f64 / 1e9 * 1000.0 / frames;
-    let gpu = proc::gpu_cost(&before.gpu, &after.gpu, wall).map(|c| c.busy_s * 1000.0 / frames);
+    let comp_gpu =
+        proc::gpu_cost(&before.gpu, &after.gpu, wall).map(|c| c.busy_s * 1000.0 / frames);
+    let app_gpu =
+        proc::gpu_cost(&before.app_gpu, &after.app_gpu, wall).map(|c| c.busy_s * 1000.0 / frames);
+    // The compositor's counters and this client's counters are separate DRM
+    // clients, so they add rather than replace each other. A missing side is not
+    // zero, but the other side is still a floor. `gpu_ms_per_frame` stays
+    // compositor-only for v3 compatibility; the client component is separate.
     let session_cpu = after.session_usec.saturating_sub(before.session_usec) as f64 / 1e6;
     let self_cpu = after.app_ns.saturating_sub(before.app_ns) as f64 / 1e9;
     let session_cpu_excl_self = (session_cpu - self_cpu).max(0.0);
-    let (psys_w, pkg_w) = power::delta(pw0, pw1, wall);
+    let (psys_w, pkg_w) = power::delta(pw0, pw1);
     let threads = thread_shares(&before.tasks, &after.tasks, comp_ns);
 
     ui.section(&format!("frame timing · {scenario}"));
     ui.add(
         "surfaces / frames",
-        &format!("{} / {}  ({:.1} s)", extras.len() + 1, p.frames, dur_s),
+        &format!(
+            "{} / {}  ({wall:.1} s measured)",
+            extras.len() + 1,
+            p.frames
+        ),
     );
     ui.add(
         "target / achieved",
@@ -1347,16 +1446,18 @@ async fn frame_test(
     ui.add("compositor CPU per frame", &format!("{comp_ms:.3} ms"));
     ui.add(
         "GPU time per frame",
-        &match gpu {
-            Some(ms) => format!("{ms:.3} ms"),
-            None => "no DRM counters".into(),
+        &match (comp_gpu, app_gpu) {
+            (Some(c), Some(a)) => format!("{:.3} ms ({c:.3} comp + {a:.3} client)", c + a),
+            (Some(c), None) => format!("{c:.3} ms (compositor only)"),
+            (None, Some(a)) => format!("{a:.3} ms (client only)"),
+            (None, None) => "no DRM counters".into(),
         },
     );
     ui.add("app CPU per frame", &format!("{app_ms:.3} ms"));
     ui.add(
         "session CPU during test",
         &format!(
-            "{session_cpu:.2} s over {dur_s:.0} s ({session_cpu_excl_self:.2} s excluding this tool)"
+            "{session_cpu:.2} s over {wall:.1} s ({session_cpu_excl_self:.2} s excluding this tool)"
         ),
     );
     ui.add(
@@ -1381,6 +1482,7 @@ async fn frame_test(
     Some(report::RenderPhase {
         scenario: scenario.to_string(),
         dur_s,
+        measured_s: Some(wall),
         frames: p.frames as i64,
         dropped: p.dropped,
         fps: p.fps,
@@ -1392,11 +1494,13 @@ async fn frame_test(
         pacing_source: p.source.to_string(),
         comp_ms_per_frame: comp_ms,
         comp_ns_per_frame: comp_ns as f64 / frames,
-        gpu_ms_per_frame: gpu,
+        gpu_ms_per_frame: comp_gpu,
+        comp_gpu_ms_per_frame: comp_gpu,
+        app_gpu_ms_per_frame: app_gpu,
         app_ms_per_frame: app_ms,
         session_cpu_s: session_cpu,
-        self_cpu_s: self_cpu,
-        session_cpu_excl_self_s: session_cpu_excl_self,
+        self_cpu_s: Some(self_cpu),
+        session_cpu_excl_self_s: Some(session_cpu_excl_self),
         psys_w,
         pkg_w,
         batt_w,
@@ -1441,5 +1545,41 @@ mod tests {
         // a sample that never got an interval of its own is not invented
         assert_eq!(mean_cpu(&[]), 0.0);
         assert!((mean_cpu(&[(0.0, 42.0)]) - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_process_that_appeared_mid_window_is_not_charged_its_lifetime() {
+        let before = proc::CpuSnapshot {
+            total_usec: 0,
+            procs: vec![(1, "old".into(), 0)],
+        };
+        let after = proc::CpuSnapshot {
+            total_usec: 1_000_000,
+            procs: vec![
+                (1, "old".into(), 0),
+                // 10 s of lifetime CPU, none of it known to be in this window
+                (2, "new".into(), 10_000_000_000),
+            ],
+        };
+        let (other, top) = cpu_attribution(&before, &after, 1.0, &[]);
+        assert!(top.is_empty(), "a new process has no in-window baseline");
+        assert!((other - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribution_uses_the_same_window_for_the_total_and_the_offenders() {
+        let before = proc::CpuSnapshot {
+            total_usec: 0,
+            procs: vec![(1, "old".into(), 0), (2, "busy".into(), 0)],
+        };
+        let after = proc::CpuSnapshot {
+            total_usec: 2_000_000,
+            procs: vec![(1, "old".into(), 0), (2, "busy".into(), 2_000_000_000)],
+        };
+        let (other, top) = cpu_attribution(&before, &after, 2.0, &[]);
+        assert!((other - 100.0).abs() < 1e-9);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0, "busy");
+        assert!((top[0].1 - 100.0).abs() < 1e-9);
     }
 }

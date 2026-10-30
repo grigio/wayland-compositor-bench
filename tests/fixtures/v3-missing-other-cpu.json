@@ -1,0 +1,32 @@
+{
+  "schema_version": 3,
+  "label": "labwc",
+  "compositor": "labwc",
+  "clean": true,
+  "idle": {
+    "dur_s": 20.0,
+    "settle_s": 3.0,
+    "mem_mib": 700.0,
+    "cpu_pct": 4.2,
+    "comp_cpu_pct": 3.1,
+    "wakeups_per_s": 120.0
+  },
+  "windows": {
+    "extra": 4,
+    "settle_s": 3.0,
+    "baseline_mib": 800.0,
+    "with_windows_mib": 800.0,
+    "delta_mib": 0.0,
+    "per_window_mib": 0.0,
+    "comp_delta_mib": 0.0,
+    "client_delta_mib": 0.0,
+    "residual_mib": -2.0
+  },
+  "render": {
+    "scenario": "single",
+    "dur_s": 6.0,
+    "frames": 720,
+    "comp_ms_per_frame": 0.08,
+    "app_ms_per_frame": 0.12
+  }
+}

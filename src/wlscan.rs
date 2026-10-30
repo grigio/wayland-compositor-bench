@@ -56,6 +56,9 @@ pub struct Global {
 pub struct Scan {
     pub globals: Vec<Global>,
     pub blur: BlurState,
+    /// true when the registry was enumerated; a failed connection is not an
+    /// empty compositor
+    pub connected: bool,
 }
 
 /// Registry state for the probe: only the blur capabilities are interesting.
@@ -110,6 +113,7 @@ pub fn scan() -> Scan {
     let Ok((globals, mut queue)) = registry_queue_init::<Probe>(&conn) else {
         return out;
     };
+    out.connected = true;
     out.globals = globals
         .contents()
         .clone_list()
@@ -172,6 +176,17 @@ impl Tier {
     /// Whether the tier counts towards the headline coverage number.
     pub fn relevant(self) -> bool {
         matches!(self, Tier::Core | Tier::Rendering | Tier::Desktop)
+    }
+
+    /// Stable lowercase key for the JSON schema.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tier::Core => "core",
+            Tier::Rendering => "rendering",
+            Tier::Desktop => "desktop",
+            Tier::Wlroots => "wlroots",
+            Tier::Optional => "optional",
+        }
     }
 }
 
@@ -449,12 +464,14 @@ impl Item {
 
 pub struct Features {
     pub items: Vec<Item>,
-    /// coverage over the tiers that matter
+    /// coverage over the tiers that matter, including stale versions
     pub supported: usize,
     pub total: usize,
     /// every tier, including wlroots heritage and optional protocols
     pub supported_all: usize,
     pub total_all: usize,
+    /// advertised but below the useful version
+    pub stale: usize,
     /// globals the reference list does not know about
     pub extra: usize,
 }
@@ -473,6 +490,7 @@ pub fn evaluate(globals: &[Global]) -> Features {
     let mut supported = 0;
     let mut supported_all = 0;
     let mut total = 0;
+    let mut stale = 0;
     let mut items = Vec::with_capacity(FEATURES.len());
     for feature in FEATURES {
         let version = globals
@@ -484,6 +502,9 @@ pub fn evaluate(globals: &[Global]) -> Features {
             if feature.tier.relevant() {
                 supported += 1;
             }
+        }
+        if matches!(version, Some(v) if v < feature.since) {
+            stale += 1;
         }
         if feature.tier.relevant() {
             total += 1;
@@ -500,6 +521,7 @@ pub fn evaluate(globals: &[Global]) -> Features {
         total,
         supported_all,
         total_all: FEATURES.len(),
+        stale,
         extra,
     }
 }
@@ -536,6 +558,8 @@ mod tests {
             .unwrap();
         assert_eq!(item.version, Some(2));
         assert!(item.stale(), "wl_seat 2 is below the useful version");
+        assert_eq!(f.stale, 1);
+        assert_eq!(f.supported, 1, "advertised coverage is unchanged");
     }
 
     #[test]

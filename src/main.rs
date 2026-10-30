@@ -1,3 +1,4 @@
+mod access;
 mod bench;
 mod cli;
 mod cpuchart;
@@ -68,6 +69,16 @@ window.wbg, window.wbg.background { background-color: transparent; }
 .stat-title { font-size: 11px; font-weight: 700; letter-spacing: 0.10em; color: rgba(255,255,255,0.45); }
 .stat-big { font-size: 31px; font-weight: 800; color: #ffffff; }
 .stat-sub { font-size: 12px; color: rgba(255,255,255,0.45); }
+.access-check {
+    font-size: 11.5px;
+    border-radius: 8px; padding: 8px 10px;
+}
+.access-ok {
+    color: #86efac; background-color: rgba(74,222,128,0.08);
+}
+.access-warn {
+    color: #fcd34d; background-color: rgba(251,191,36,0.08);
+}
 .chip {
     background-color: rgba(255,255,255,0.09);
     border-radius: 999px; padding: 3px 10px;
@@ -328,7 +339,7 @@ impl SummaryUi {
         root.append(&chart.area);
 
         let hint = gtk::Label::new(Some(
-            "further out is better · fps vs panel refresh · RAM and CPU vs what the system has (log axes) · RAM peak and CPU average during the run",
+            "further out is better · pacing vs the observed cadence · compositor CPU per frame vs the frame budget · compositor RAM and CPU vs what the system has (log axes)",
         ));
         hint.set_xalign(0.0);
         hint.set_wrap(true);
@@ -395,13 +406,14 @@ impl SummaryUi {
 
     fn show(&self, s: &bench::Summary) {
         self.radar.set(&radar::Values {
-            fps: s.fps,
-            target_hz: s.target_hz,
+            pacing_single: s.pacing_single,
+            pacing_multi: s.pacing_multi,
+            comp_ms_per_frame: s.comp_ms_per_frame_multi,
+            cadence_hz: s.cadence_hz_multi,
+            comp_pss_mib: s.comp_mib,
+            comp_cpu_pct: s.comp_cpu_pct,
+            comp_known: s.comp_mib > 0.0,
             feat_pct: s.feat_pct,
-            ram_before_mib: s.ram_mib,
-            ram_peak_mib: s.ram_peak_mib,
-            cpu_idle_pct: s.cpu_pct,
-            cpu_avg_pct: s.cpu_avg_pct,
         });
         self.chart.set(&s.cpu_series, &s.cpu_marks);
         let gpu = s
@@ -409,7 +421,7 @@ impl SummaryUi {
             .map(|g| format!(" · {g:.3} ms GPU"))
             .unwrap_or_default();
         self.comp.set_text(&format!(
-            "RAM {} → {} peak · CPU {} → {} peak · {:.1}% other CPU · compositor {:.0} MiB PSS · {:.3} ms CPU/frame{} · confidence {}",
+            "session RAM {} → {} peak · session CPU {} → {} peak · {:.1}% other CPU · compositor {:.0} MiB PSS · {:.3} ms CPU/frame{} · confidence {}",
             sysinfo::fmt_mib(s.ram_mib),
             sysinfo::fmt_mib(s.ram_peak_mib),
             sysinfo::fmt_pct(s.cpu_pct),
@@ -522,8 +534,21 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into())
     );
     let cg = proc::session_cgroup();
-    println!("  cgroup           {}", cg.display());
-    if !proc::cgroup_exact() {
+    println!(
+        "  cgroup           {} ({})",
+        cg.display(),
+        proc::cgroup_label()
+    );
+    let cg_readable = ["memory.current", "memory.stat", "cpu.stat", "cgroup.procs"]
+        .iter()
+        .all(|f| proc::read(&cg.join(f).to_string_lossy()).is_some());
+    if !cg_readable {
+        warn.push(format!(
+            "no readable cgroup v2 counters at {}: session RAM/CPU are unavailable (cgroup v1 or \
+             no session scope)",
+            cg.display()
+        ));
+    } else if !proc::cgroup_exact() {
         warn.push(
             "no session scope: the user slice also contains other sessions, so RAM and CPU are \
              not this session's"
@@ -553,6 +578,21 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
             }
             if let Some(hash) = proc::config_hash(&c.name) {
                 println!("  config hash      {hash}");
+            }
+            if proc::pss_kb(c.pid) == 0 {
+                warn.push(format!(
+                    "/proc/{}/smaps_rollup is unreadable: compositor PSS will be 0 (hidepid or \
+                     permissions)",
+                    c.pid
+                ));
+            }
+            let tasks = proc::tasks(c.pid);
+            if tasks.is_empty() || tasks.iter().all(|t| t.ns == 0) {
+                warn.push(
+                    "schedstat is missing or zero: compositor CPU will be coarse or 0 (enable \
+                     CONFIG_SCHEDSTATS)"
+                        .into(),
+                );
             }
         }
         None => {
@@ -653,6 +693,16 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
     }
     if env.throttled {
         warn.push("RAPL throttle counters are non-zero: the CPU is thermally limited".into());
+    }
+    if sysinfo::psi(cg, "cpu.pressure").is_some() && sysinfo::psi(cg, "memory.pressure").is_some() {
+        println!("  pressure         cpu + memory PSI");
+    } else {
+        println!("  pressure         unavailable");
+        warn.push(
+            "no cpu.pressure / memory.pressure: pressure stalls are unavailable (enable CONFIG_PSI \
+             and use a cgroup v2 mount)"
+                .into(),
+        );
     }
 
     println!("\nwhat a run would do");
@@ -856,6 +906,8 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     surface.add_css_class("chart");
     surface.set_visible(false);
 
+    // Resolve the compositor once: the pre-run probe and the run both need it.
+    let comp = proc::compositor();
     let summary_ui = SummaryUi::build();
 
     // before the first run the right-hand pane explains itself; the animation
@@ -875,8 +927,22 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     ph_hint.add_css_class("stat-sub");
     ph_hint.set_wrap(true);
     ph_hint.set_justify(gtk::Justification::Center);
+    // Filled after the first frame: `power::readable()` may fork `sudo -n`, and
+    // that must not delay the window. Hidden until the probe has run; then it
+    // always shows a tick, or a cross when a source is missing.
+    let ph_warn = gtk::Label::new(None);
+    ph_warn.add_css_class("access-check");
+    ph_warn.set_xalign(0.0);
+    ph_warn.set_wrap(true);
+    ph_warn.set_justify(gtk::Justification::Left);
+    ph_warn.set_halign(gtk::Align::Start);
+    ph_warn.set_max_width_chars(54);
+    ph_warn.set_margin_top(8);
+    ph_warn.set_selectable(true);
+    ph_warn.set_visible(false);
     ph_inner.append(&ph_title);
     ph_inner.append(&ph_hint);
+    ph_inner.append(&ph_warn);
     placeholder.append(&ph_inner);
 
     let stack = gtk::Stack::new();
@@ -1060,7 +1126,6 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             set_blur_chip(&chip, state.get(), now);
         });
     }
-    let comp = proc::compositor();
     let comp_pid = comp.as_ref().map(|c| c.pid);
     let monitor = gtk::gdk::Display::default()
         .and_then(|d| d.monitors().item(0))
@@ -1414,6 +1479,25 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     window.set_child(Some(&overlay));
     window.present();
 
+    // The access probe may fork `sudo -n` for RAPL, so run it after the first
+    // frame; the placeholder is already visible by then. The result is always
+    // shown: a tick says every source was checked, a cross names the ones that
+    // are missing.
+    {
+        let warn = ph_warn.clone();
+        let comp = comp.clone();
+        glib::timeout_add_local_once(Duration::from_millis(200), move || {
+            let issues = access::probe(comp.as_ref());
+            if issues.is_empty() {
+                warn.add_css_class("access-ok");
+            } else {
+                warn.add_css_class("access-warn");
+            }
+            warn.set_markup(&access::markup(&issues));
+            warn.set_visible(true);
+        });
+    }
+
     // run the probe after the window is up, so its roundtrip does not delay
     // the first frame
     {
@@ -1467,15 +1551,12 @@ fn cpu_detail() -> String {
     s
 }
 
-/// Radar ceilings: this machine's total RAM and its full CPU capacity, so the
-/// chart shows a share of what the system has instead of an arbitrary constant.
+/// Radar ceiling: this machine's total RAM, so the memory vertex shows a share
+/// of what the system has instead of an arbitrary constant. The CPU axis is
+/// relative to one core, which is the unit every CPU figure in the UI uses.
 fn radar_limits() -> radar::Limits {
-    let (_, threads) = sysinfo::cpu_topology();
     let (total_ram_mib, _) = sysinfo::total_ram_mib();
-    radar::Limits {
-        total_ram_mib,
-        cpu_capacity_pct: threads as f64 * 100.0,
-    }
+    radar::Limits { total_ram_mib }
 }
 
 /// `labwc:wlroots` reads better as `labwc · wlroots` in a dense info column.

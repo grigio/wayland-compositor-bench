@@ -4,6 +4,78 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-10-30
+
+### Added
+
+- Hover help on the radar: hovering an axis label highlights that axis and
+  shows a tooltip with what it plots and which direction is better. Every axis
+  is further-out-is-better, including the cost axes, so the tooltip spells out
+  that the plotted value is inverted.
+- The placeholder before the radar now warns which metrics this machine cannot
+  provide, with the path and the fix: cgroup v1 or a missing session scope,
+  unreadable RAPL, a `hidepid` `/proc`, missing `schedstat` or PSI, and an
+  unresolved compositor. A green tick confirms the check when every source is
+  readable; a red cross marks the ones that are not. The probe runs after the
+  first frame so the RAPL `sudo -n` fallback cannot delay the window.
+- The run JSON now carries the whole protocol snapshot in `features`, including
+  per-item versions and a `stale` flag for globals advertised below the useful
+  version. A failed scan writes `null`, not `0 %`.
+- `idle.measured_s` and `render.measured_s` record the actual wall-clock window;
+  `windows` gained optional `baseline_drift_mib` and `post_close_drift_mib`,
+  `delta_valid`, and a signed `delta_mib`; `render` stores
+  `comp_gpu_ms_per_frame` and `app_gpu_ms_per_frame` separately, while
+  `gpu_ms_per_frame` keeps its compositor-only v3 meaning.
+
+### Changed
+
+- The radar now plots the compositor's attributable cost instead of session
+  totals: `PACING` and `LOAD PACING` (frames delivered at the observed cadence,
+  one surface and the multi-surface load case), `RENDER COST` (compositor CPU
+  per frame against the cadence period), `COMP RAM` (compositor PSS relative to
+  total RAM), `COMP CPU` (compositor idle CPU relative to one core) and
+  `FEATURES`. A clean 60 fps on a 120 Hz panel now reads 100 %, not 50 %, and
+  RAM before/peak — two vertices a few MiB apart — are gone. The session totals
+  stay in the line under the chart.
+- Idle CPU and power now use the measured wall-clock interval. The start
+  snapshot scans before reading counters, the end snapshot reads counters before
+  scanning, and the power samples bracket only the sleep, so neither `/proc`
+  walk nor the requested `--idle` value is in the denominator.
+- `other CPU` and its top offenders now come from the same idle window and the
+  same exclusion set (compositor process tree plus this tool); a process that
+  appeared mid-window is no longer charged its whole lifetime CPU.
+- `wakeups/s` sums context switches over every compositor thread instead of only
+  the thread-group leader.
+- GPU counters are parsed per engine (`rcs`, `bcs`, `vcs`, `ccs`, …), merged per
+  client with `max` per engine, and summed across engines. Frame tests sample
+  the benchmark client as well as the compositor; `gpu_ms_per_frame` keeps its
+  compositor-only v3 meaning and the client is stored separately.
+- Extra-toplevel memory settles for a second, takes two baselines, keeps the raw
+  signed delta, and marks a negative or drifting measurement invalid instead of
+  clamping it to zero. `residual_mib` keeps its v3 meaning (what the session did
+  not give back); `post_close_drift_mib` is the drift between two post-close
+  samples.
+
+### Fixed
+
+- GNOME sessions were measured as the whole user slice. GNOME Shell runs as a
+  systemd user service and the apps it launches live in `app-*.scope` units
+  below `user@UID.service`, so `/proc/self/cgroup` never contains a
+  `session-N.scope`: the tool fell back to `user-1000.slice`, `--check` exited
+  2 with "no session scope", and session RAM/CPU could include other logins
+  even though the window still showed numbers. The user manager is now the
+  measured scope; the user slice is only used when neither it nor a login
+  session scope exists. Process-level data (process count, idle CPU
+  attribution, contaminants) now walks the cgroup subtree: the manager's own
+  `cgroup.procs` is empty because systemd attaches every process to a child
+  cgroup.
+- A v3 file without `other_cpu_pct` no longer prints `0.00` (the best possible
+  value). Missing optional numerics print `-`, and `--compare` prints
+  `not measured` or an absolute delta with `n/a` for a zero baseline instead of
+  a fabricated `+0 %`.
+- `--idle NaN` no longer reaches `Duration::from_secs_f64` and panics; the
+  duration options must be finite.
+
 ## [0.4.0] — 2026-10-30
 
 ### Added

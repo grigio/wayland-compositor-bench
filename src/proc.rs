@@ -10,7 +10,7 @@
 //!   socket, not "the oldest process with a known name". Nested compositors and
 //!   multi-seat setups make the name heuristic pick the wrong process.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -25,38 +25,106 @@ pub fn read_u64(path: &str) -> Option<u64> {
 
 // ---------------------------------------------------------------- cgroup ---
 
-/// The cgroup of this login session (`.../session-N.scope`), or the user slice
-/// when the session has none (some greeters, TTY-started compositors).
-pub fn session_cgroup() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
+/// Which kind of cgroup holds the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// A logind login session scope, `session-N.scope`.
+    Login,
+    /// The systemd user manager, `user@UID.service`. Desktops that run the
+    /// compositor as a user service (GNOME, Plasma 6) keep the whole session —
+    /// shell, session services and app scopes — here, outside the login
+    /// session scope.
+    UserManager,
+    /// The user slice, which also contains other sessions of the same user.
+    /// Only used when neither of the above is available.
+    UserSlice,
+}
+
+impl Scope {
+    /// True when every process below the directory belongs to this session.
+    fn exact(self) -> bool {
+        self != Scope::UserSlice
+    }
+}
+
+struct ScopeDir {
+    dir: PathBuf,
+    kind: Scope,
+}
+
+/// `/proc/self/cgroup`'s cgroup v2 path → the directory to measure.
+///
+/// A terminal started by GNOME Shell runs in
+/// `.../user@1000.service/app.slice/app-gnome-….scope`, so its own path has no
+/// `session-N.scope` at all. Looking only for a login session scope therefore
+/// dropped to the user slice, which also holds other logins; the user manager
+/// is the scope that actually contains this desktop.
+fn resolve_scope(path: &str, uid: u32) -> (PathBuf, Scope) {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, seg) in segs.iter().enumerate() {
+        let kind = if seg.starts_with("session-") && seg.ends_with(".scope") {
+            Scope::Login
+        } else if seg.starts_with("user@") && seg.ends_with(".service") {
+            Scope::UserManager
+        } else {
+            continue;
+        };
+        let mut dir = PathBuf::from("/sys/fs/cgroup");
+        for s in &segs[..=i] {
+            dir.push(s);
+        }
+        return (dir, kind);
+    }
+    (
+        PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice")),
+        Scope::UserSlice,
+    )
+}
+
+fn scope_dir() -> &'static ScopeDir {
+    static SCOPE: OnceLock<ScopeDir> = OnceLock::new();
+    SCOPE.get_or_init(|| {
         let raw = read("/proc/self/cgroup").unwrap_or_default();
         let path = raw
             .lines()
             .find_map(|l| l.strip_prefix("0::"))
-            .unwrap_or("/")
-            .to_string();
-        if let Some(idx) = path.find("/session-") {
-            let rest = &path[idx..];
-            if let Some(end) = rest.find(".scope") {
-                let p = PathBuf::from("/sys/fs/cgroup").join(&path[1..idx + end + ".scope".len()]);
-                if p.join("memory.current").exists() {
-                    return p;
-                }
-            }
-        }
+            .unwrap_or("/");
         let uid = unsafe { getuid() };
-        PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice"))
+        let (dir, kind) = resolve_scope(path, uid);
+        // `memory.current` proves the memory controller is enabled on the
+        // directory. A session or user manager without it cannot be measured,
+        // so the user slice is the last resort.
+        if kind.exact() && dir.join("memory.current").exists() {
+            return ScopeDir { dir, kind };
+        }
+        ScopeDir {
+            dir: PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice")),
+            kind: Scope::UserSlice,
+        }
     })
 }
 
-/// False when the session has no `session-N.scope` and we fell back to the
-/// user slice, which also contains other sessions and unrelated processes.
+/// The cgroup of this session: its `session-N.scope`, or the systemd user
+/// manager that hosts the desktop (`GNOME`, `Plasma`). Falls back to the user
+/// slice when neither exists (some greeters, TTY-started compositors,
+/// containers).
+pub fn session_cgroup() -> &'static Path {
+    &scope_dir().dir
+}
+
+/// False only when we fell back to the user slice, which also contains other
+/// sessions and unrelated processes.
 pub fn cgroup_exact() -> bool {
-    session_cgroup()
-        .file_name()
-        .map(|n| n.to_string_lossy().starts_with("session-"))
-        .unwrap_or(false)
+    scope_dir().kind.exact()
+}
+
+/// Human name of the resolved scope, for `--check`.
+pub fn cgroup_label() -> &'static str {
+    match scope_dir().kind {
+        Scope::Login => "login session scope",
+        Scope::UserManager => "systemd user manager",
+        Scope::UserSlice => "user slice fallback",
+    }
 }
 
 pub fn cpu_usage_usec(dir: &Path) -> u64 {
@@ -107,14 +175,31 @@ pub fn mem_stat(dir: &Path) -> MemStat {
     out
 }
 
+/// Every process in the cgroup subtree, not just the ones attached directly to
+/// its root. systemd keeps the session's processes in child cgroups
+/// (`session.slice`, `app.slice`), so `user@<uid>.service/cgroup.procs` is
+/// usually empty even though the whole desktop lives below it.
 pub fn pids_in_cgroup(dir: &Path) -> Vec<u32> {
-    fs::read_to_string(dir.join("cgroup.procs"))
-        .map(|s| {
-            s.split_whitespace()
-                .filter_map(|p| p.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    collect_pids(dir, 0, &mut out);
+    out
+}
+
+fn collect_pids(dir: &Path, depth: u32, out: &mut Vec<u32>) {
+    // User hierarchies are shallow; the cap only stops a symlink loop.
+    if depth > 32 {
+        return;
+    }
+    if let Ok(s) = fs::read_to_string(dir.join("cgroup.procs")) {
+        out.extend(s.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            collect_pids(&path, depth + 1, out);
+        }
+    }
 }
 
 /// The kernel's own high-water mark for the session, in MiB. It is only
@@ -272,9 +357,10 @@ pub struct ProcStatus {
 }
 
 pub fn status(pid: u32) -> ProcStatus {
-    let Some(s) = read(&format!("/proc/{pid}/status")) else {
-        return ProcStatus::default();
-    };
+    parse_status(&read(&format!("/proc/{pid}/status")).unwrap_or_default())
+}
+
+fn parse_status(s: &str) -> ProcStatus {
     let mut out = ProcStatus::default();
     for line in s.lines() {
         if line.starts_with("voluntary_ctxt_switches")
@@ -296,6 +382,31 @@ pub fn status(pid: u32) -> ProcStatus {
         }
     }
     out
+}
+
+/// Context switches for the whole process, not just the thread-group leader.
+///
+/// `/proc/<pid>/status` prints only the leader's counters. Every other thread
+/// has its own status file, and on a compositor the worker threads often do most
+/// of the waking, so summing the leader alone undercounts by a large factor.
+pub fn process_wakeups(pid: u32) -> u64 {
+    wakeups_in_task_dir(Path::new(&format!("/proc/{pid}/task")))
+}
+
+/// Sum the wakeup counters in one `task/` directory. Split out so the summing
+/// rule can be tested without racing threads entering and leaving the test
+/// process: a thread that exits takes its counter with it.
+fn wakeups_in_task_dir(dir: &Path) -> u64 {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let tid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let s = read(&format!("{}/{tid}/status", dir.display()))?;
+            Some(parse_status(&s).wakeups)
+        })
+        .sum()
 }
 
 /// CPU time of one process in nanoseconds, from `utime + stime` in
@@ -335,28 +446,40 @@ pub struct CpuSnapshot {
     pub procs: Vec<(u32, String, u64)>,
 }
 
-pub fn cpu_snapshot() -> CpuSnapshot {
-    let dir = session_cgroup();
-    let total_usec = cpu_usage_usec(dir);
-    let procs = pids_in_cgroup(dir)
+/// Per-process `utime + stime` for the session cgroup, without re-reading the
+/// cgroup total. Used when the total comes from a different, tighter instant.
+pub fn cpu_procs() -> Vec<(u32, String, u64)> {
+    pids_in_cgroup(session_cgroup())
         .into_iter()
         .filter_map(|pid| {
             let ns = cpu_time_ns(pid)?;
             let name = comm(pid).unwrap_or_else(|| format!("pid {pid}"));
             Some((pid, name, ns))
         })
-        .collect();
-    CpuSnapshot { total_usec, procs }
+        .collect()
 }
 
 // ------------------------------------------------------------------- gpu ---
+
+/// GPU busy counters for one DRM client, split by engine. A client can run work
+/// on render, copy and video engines in the same window; collapsing them to one
+/// scalar silently reports only the busiest engine.
+#[derive(Clone, Debug, Default)]
+pub struct GpuClient {
+    /// absolute GPU nanoseconds per engine (amdgpu/i915 `drm-engine-*`)
+    pub engine_ns: BTreeMap<String, u64>,
+    /// busy cycles per engine (`drm-cycles-*`)
+    pub cycles: BTreeMap<String, u64>,
+    /// total cycles per engine (`drm-total-cycles-*`)
+    pub total_cycles: BTreeMap<String, u64>,
+}
 
 /// Per-client GPU counters from `/proc/<pid>/fdinfo`. No root needed: the
 /// driver exposes them to the process owner.
 #[derive(Clone, Debug, Default)]
 pub struct Gpu {
-    /// drm-client-id -> (busy cycles, total cycles, absolute busy ns)
-    pub clients: HashMap<u64, (u64, u64, u64)>,
+    /// drm-client-id -> per-engine counters
+    pub clients: HashMap<u64, GpuClient>,
     /// bytes held by this process's clients, shared buffers included
     pub resident: u64,
     /// the part of `resident` that is not marked shared, i.e. what this process
@@ -392,13 +515,13 @@ fn parse_bytes(v: &str) -> Option<u64> {
 }
 
 /// Several fds can point at the same DRM client and report identical counters,
-/// so values are merged per client id (max), never summed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// so values are merged per client id (max per engine), never summed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FdInfo {
     id: u64,
-    cycles: u64,
-    total_cycles: u64,
-    engine_ns: u64,
+    cycles: BTreeMap<String, u64>,
+    total_cycles: BTreeMap<String, u64>,
+    engine_ns: BTreeMap<String, u64>,
     held: u64,
     shared: u64,
 }
@@ -418,23 +541,28 @@ fn parse_fdinfo(text: &str) -> Option<FdInfo> {
             id = parse_num(v);
             continue;
         }
-        // i915/amdgpu: absolute GPU nanoseconds for this client
-        if k.starts_with("drm-engine-") {
+        // i915/amdgpu: absolute GPU nanoseconds for this client. Capacity keys
+        // carry a ring count, not a duration; treating them as nanoseconds
+        // invents GPU time out of nowhere.
+        if let Some(engine) = k.strip_prefix("drm-engine-") {
+            if engine.starts_with("capacity-") {
+                continue;
+            }
             if let Some(n) = parse_num(v) {
-                out.engine_ns = out.engine_ns.max(n);
+                insert_max(&mut out.engine_ns, engine, n);
             }
             continue;
         }
         // xe/i915: cycle counters, only meaningful as a ratio
-        if k.starts_with("drm-total-cycles-") {
+        if let Some(engine) = k.strip_prefix("drm-total-cycles-") {
             if let Some(n) = parse_num(v) {
-                out.total_cycles = out.total_cycles.max(n);
+                insert_max(&mut out.total_cycles, engine, n);
             }
             continue;
         }
-        if k.starts_with("drm-cycles-") {
+        if let Some(engine) = k.strip_prefix("drm-cycles-") {
             if let Some(n) = parse_num(v) {
-                out.cycles = out.cycles.max(n);
+                insert_max(&mut out.cycles, engine, n);
             }
             continue;
         }
@@ -463,6 +591,30 @@ fn parse_fdinfo(text: &str) -> Option<FdInfo> {
     Some(out)
 }
 
+fn insert_max(map: &mut BTreeMap<String, u64>, key: &str, value: u64) {
+    let slot = map.entry(key.to_string()).or_default();
+    *slot = (*slot).max(value);
+}
+
+fn merge_maps(dst: &mut BTreeMap<String, u64>, src: &BTreeMap<String, u64>) {
+    for (key, value) in src {
+        let slot = dst.entry(key.clone()).or_default();
+        *slot = (*slot).max(*value);
+    }
+}
+
+/// Merge one fd's view of a client into the per-client record. The same client
+/// can be visible through several fds; the counters are identical, so `max` per
+/// engine keeps them from being counted twice.
+fn merge_fdinfo(per_client: &mut HashMap<u64, FdInfo>, info: FdInfo) {
+    let entry = per_client.entry(info.id).or_default();
+    merge_maps(&mut entry.cycles, &info.cycles);
+    merge_maps(&mut entry.total_cycles, &info.total_cycles);
+    merge_maps(&mut entry.engine_ns, &info.engine_ns);
+    entry.held = entry.held.max(info.held);
+    entry.shared = entry.shared.max(info.shared);
+}
+
 pub fn gpu(pid: u32) -> Gpu {
     let mut out = Gpu::default();
     let Ok(rd) = fs::read_dir(format!("/proc/{pid}/fdinfo")) else {
@@ -476,16 +628,17 @@ pub fn gpu(pid: u32) -> Gpu {
         let Some(info) = parse_fdinfo(&s) else {
             continue;
         };
-        let e = per_client.entry(info.id).or_default();
-        e.cycles = e.cycles.max(info.cycles);
-        e.total_cycles = e.total_cycles.max(info.total_cycles);
-        e.engine_ns = e.engine_ns.max(info.engine_ns);
-        e.held = e.held.max(info.held);
-        e.shared = e.shared.max(info.shared);
+        merge_fdinfo(&mut per_client, info);
     }
     for (id, c) in per_client {
-        out.clients
-            .insert(id, (c.cycles, c.total_cycles, c.engine_ns));
+        out.clients.insert(
+            id,
+            GpuClient {
+                engine_ns: c.engine_ns,
+                cycles: c.cycles,
+                total_cycles: c.total_cycles,
+            },
+        );
         out.resident += c.held;
         out.private += c.held.saturating_sub(c.shared);
     }
@@ -498,30 +651,51 @@ pub struct GpuCost {
     pub busy_s: f64,
 }
 
-/// GPU time between two samples. When the driver only exposes cycle counters,
-/// the ratio `busy / total` is unit-free, so it can be scaled by wall time for
-/// each client separately and summed.
+/// GPU time between two samples, summed over engines and clients.
+///
+/// Absolute `drm-engine-*` nanoseconds are preferred. When a driver only exposes
+/// cycle counters, the unit-free `busy / total` ratio is scaled by wall time for
+/// each engine separately. GPUs can overlap engines, so the result can exceed
+/// the wall-clock window; that is the point of keeping them apart.
 pub fn gpu_cost(a: &Gpu, b: &Gpu, elapsed_s: f64) -> Option<GpuCost> {
     if !b.available() || elapsed_s <= 0.0 {
         return None;
     }
     let mut busy = 0.0;
     let mut any = false;
-    for (id, (cycles, total, engine)) in &b.clients {
-        let Some((pc, pt, pe)) = a.clients.get(id) else {
+    for (id, client) in &b.clients {
+        let Some(previous) = a.clients.get(id) else {
             continue;
         };
-        let dc = cycles.saturating_sub(*pc);
-        let dt = total.saturating_sub(*pt);
-        let de = engine.saturating_sub(*pe);
-        if dt > 0 {
-            // busy/total is a fraction of this client's lifetime; scaled by the
-            // measurement window it becomes wall-clock GPU time.
-            busy += dc as f64 / dt as f64 * elapsed_s;
-            any = true;
-        } else if de > 0 {
-            busy += de as f64 / 1e9;
-            any = true;
+        let mut absolute: HashSet<&str> = HashSet::new();
+        for (engine, ns) in &client.engine_ns {
+            let Some(prev) = previous.engine_ns.get(engine) else {
+                continue;
+            };
+            let delta = ns.saturating_sub(*prev);
+            if delta > 0 {
+                busy += delta as f64 / 1e9;
+                any = true;
+                absolute.insert(engine);
+            }
+        }
+        for (engine, cycles) in &client.cycles {
+            if absolute.contains(engine.as_str()) {
+                continue;
+            }
+            let (Some(prev_cycles), Some(total), Some(prev_total)) = (
+                previous.cycles.get(engine),
+                client.total_cycles.get(engine),
+                previous.total_cycles.get(engine),
+            ) else {
+                continue;
+            };
+            let dc = cycles.saturating_sub(*prev_cycles);
+            let dt = total.saturating_sub(*prev_total);
+            if dt > 0 {
+                busy += dc as f64 / dt as f64 * elapsed_s;
+                any = true;
+            }
         }
     }
     any.then_some(GpuCost { busy_s: busy })
@@ -896,6 +1070,93 @@ mod tests {
     }
 
     #[test]
+    fn an_app_scope_resolves_to_the_user_manager() {
+        // The cgroup of a terminal opened from GNOME Shell: no session scope,
+        // the whole desktop lives under user@1000.service.
+        let (dir, kind) = resolve_scope(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-Alacritty-8103.scope",
+            1000,
+        );
+        assert_eq!(kind, Scope::UserManager);
+        assert_eq!(
+            dir,
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
+        );
+    }
+
+    #[test]
+    fn a_login_session_scope_resolves_to_itself() {
+        let (dir, kind) = resolve_scope("/user.slice/user-1000.slice/session-2.scope", 1000);
+        assert_eq!(kind, Scope::Login);
+        assert_eq!(
+            dir,
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope")
+        );
+    }
+
+    #[test]
+    fn a_desktop_user_service_resolves_to_its_manager() {
+        // GNOME Shell is a user service, so the compositor's own cgroup is not
+        // enough to tell which login session it belongs to either.
+        let (dir, kind) = resolve_scope(
+            "/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@user.service",
+            1000,
+        );
+        assert_eq!(kind, Scope::UserManager);
+        assert_eq!(
+            dir,
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
+        );
+    }
+
+    #[test]
+    fn a_path_without_a_session_falls_back_to_the_user_slice() {
+        let (dir, kind) = resolve_scope("/docker/abc123", 1000);
+        assert_eq!(kind, Scope::UserSlice);
+        assert_eq!(dir, Path::new("/sys/fs/cgroup/user.slice/user-1000.slice"));
+        assert!(!kind.exact());
+    }
+
+    #[test]
+    fn pids_in_cgroup_walks_child_cgroups() {
+        // systemd keeps the session's processes in session.slice and app.slice,
+        // so the root's cgroup.procs is usually empty.
+        let root = std::env::temp_dir().join(format!("wcb-cgroup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("app.slice/app-gnome-Terminal.scope")).unwrap();
+        fs::create_dir_all(root.join("session.slice")).unwrap();
+        fs::write(root.join("cgroup.procs"), "").unwrap();
+        fs::write(
+            root.join("app.slice/app-gnome-Terminal.scope/cgroup.procs"),
+            "12\n34\n",
+        )
+        .unwrap();
+        fs::write(root.join("session.slice/cgroup.procs"), "56\n").unwrap();
+        let mut pids = pids_in_cgroup(&root);
+        pids.sort_unstable();
+        assert_eq!(pids, vec![12, 34, 56]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pids_in_cgroup_on_this_session_includes_this_process() {
+        let pids = pids_in_cgroup(session_cgroup());
+        if pids.is_empty() {
+            eprintln!(
+                "skipping: {} has no nested processes",
+                session_cgroup().display()
+            );
+            return;
+        }
+        assert!(
+            pids.contains(&std::process::id()),
+            "own pid {} missing from {}",
+            std::process::id(),
+            session_cgroup().display()
+        );
+    }
+
+    #[test]
     fn memory_units_are_honoured() {
         assert_eq!(parse_bytes("126584 KiB"), Some(126_584 * 1024));
         assert_eq!(parse_bytes("48 MiB"), Some(48 * 1_048_576));
@@ -925,8 +1186,8 @@ drm-total-cycles-rcs:\t2139146184137
         assert_eq!(info.id, 5218);
         assert_eq!(info.held, 126_584 * 1024, "total-gtt, counted once");
         assert_eq!(info.shared, 48 * 1_048_576);
-        assert_eq!(info.cycles, 1_589_032);
-        assert_eq!(info.total_cycles, 2_139_146_184_137);
+        assert_eq!(info.cycles.get("rcs"), Some(&1_589_032));
+        assert_eq!(info.total_cycles.get("rcs"), Some(&2_139_146_184_137));
     }
 
     #[test]
@@ -935,24 +1196,149 @@ drm-total-cycles-rcs:\t2139146184137
     }
 
     #[test]
+    fn gpu_engines_are_kept_separate() {
+        // Real Xe layout: render, copy and video counters in one fd.
+        let text = "\
+drm-client-id:\t7
+drm-cycles-rcs:\t100
+drm-total-cycles-rcs:\t1000
+drm-cycles-bcs:\t50
+drm-total-cycles-bcs:\t500
+drm-engine-gfx:\t9000000000
+drm-engine-capacity-gfx:\t1
+";
+        let info = parse_fdinfo(text).expect("fdinfo");
+        assert_eq!(info.cycles.get("rcs"), Some(&100));
+        assert_eq!(info.cycles.get("bcs"), Some(&50));
+        assert_eq!(info.total_cycles.get("bcs"), Some(&500));
+        assert_eq!(info.engine_ns.get("gfx"), Some(&9_000_000_000));
+        assert_eq!(info.engine_ns.len(), 1, "engine capacity is not a duration");
+    }
+
+    #[test]
+    fn duplicate_fds_merge_per_client_with_max_not_sum() {
+        let mut per_client = HashMap::new();
+        let first = FdInfo {
+            id: 9,
+            cycles: BTreeMap::from([("rcs".into(), 100), ("bcs".into(), 10)]),
+            total_cycles: BTreeMap::from([("rcs".into(), 1000), ("bcs".into(), 100)]),
+            engine_ns: BTreeMap::from([("gfx".into(), 500)]),
+            held: 1024,
+            shared: 0,
+        };
+        let second = FdInfo {
+            id: 9,
+            cycles: BTreeMap::from([("rcs".into(), 200), ("bcs".into(), 5)]),
+            total_cycles: BTreeMap::from([("rcs".into(), 2000), ("bcs".into(), 100)]),
+            engine_ns: BTreeMap::from([("gfx".into(), 900)]),
+            held: 2048,
+            shared: 512,
+        };
+        merge_fdinfo(&mut per_client, first);
+        merge_fdinfo(&mut per_client, second);
+        let merged = &per_client[&9];
+        assert_eq!(merged.cycles.get("rcs"), Some(&200));
+        assert_eq!(merged.cycles.get("bcs"), Some(&10));
+        assert_eq!(merged.engine_ns.get("gfx"), Some(&900));
+        assert_eq!(merged.held, 2048);
+        assert_eq!(merged.shared, 512);
+    }
+
+    #[test]
     fn gpu_cost_needs_two_samples() {
         let a = Gpu::default();
         assert!(gpu_cost(&a, &a, 1.0).is_none());
         let mut b = Gpu::default();
-        b.clients.insert(1, (100, 1000, 0));
+        b.clients.insert(1, GpuClient::default());
         // client missing from the earlier sample: no delta, no estimate
         assert!(gpu_cost(&a, &b, 1.0).is_none());
     }
 
     #[test]
-    fn gpu_cost_uses_the_busy_ratio() {
+    fn gpu_cost_sums_each_engine_not_just_the_busiest() {
         let mut a = Gpu::default();
         let mut b = Gpu::default();
-        a.clients.insert(7, (100, 1_000, 0));
-        b.clients.insert(7, (400, 4_000, 0));
-        // busy grew 300 while total grew 3000 -> 10% of a 2 s window
+        a.clients.insert(
+            7,
+            GpuClient {
+                cycles: BTreeMap::from([("rcs".into(), 100), ("bcs".into(), 50)]),
+                total_cycles: BTreeMap::from([("rcs".into(), 1_000), ("bcs".into(), 500)]),
+                ..Default::default()
+            },
+        );
+        b.clients.insert(
+            7,
+            GpuClient {
+                cycles: BTreeMap::from([("rcs".into(), 200), ("bcs".into(), 100)]),
+                total_cycles: BTreeMap::from([("rcs".into(), 2_000), ("bcs".into(), 1_000)]),
+                ..Default::default()
+            },
+        );
+        // render: 100/1000 * 2 s = 0.2 s; copy: 50/500 * 2 s = 0.2 s
         let c = gpu_cost(&a, &b, 2.0).unwrap();
-        assert!((c.busy_s - 0.2).abs() < 1e-9);
+        assert!((c.busy_s - 0.4).abs() < 1e-9, "{:?}", c);
+    }
+
+    #[test]
+    fn gpu_cost_uses_absolute_engine_nanoseconds_when_available() {
+        let mut a = Gpu::default();
+        let mut b = Gpu::default();
+        a.clients.insert(
+            3,
+            GpuClient {
+                engine_ns: BTreeMap::from([("gfx".into(), 1_000_000_000)]),
+                ..Default::default()
+            },
+        );
+        b.clients.insert(
+            3,
+            GpuClient {
+                engine_ns: BTreeMap::from([("gfx".into(), 1_500_000_000)]),
+                ..Default::default()
+            },
+        );
+        let c = gpu_cost(&a, &b, 1.0).unwrap();
+        assert!((c.busy_s - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn process_wakeups_include_non_leader_threads() {
+        let dir = std::env::temp_dir().join(format!(
+            "wcb-wakeups-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("100")).unwrap();
+        fs::create_dir_all(dir.join("101")).unwrap();
+        fs::write(
+            dir.join("100/status"),
+            "voluntary_ctxt_switches:\t4\nnonvoluntary_ctxt_switches:\t2\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("101/status"),
+            "voluntary_ctxt_switches:\t10\nnonvoluntary_ctxt_switches:\t5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wakeups_in_task_dir(&dir),
+            21,
+            "the leader (6) and a worker (15) must both count"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn status_parser_reads_both_switch_counters() {
+        let s = "\
+voluntary_ctxt_switches:\t4
+nonvoluntary_ctxt_switches:\t2
+Threads:\t3
+";
+        let st = parse_status(s);
+        assert_eq!(st.wakeups, 6);
+        assert_eq!(st.threads, 3);
     }
 
     #[test]

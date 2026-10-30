@@ -58,7 +58,11 @@ pub struct CpuMark {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IdlePhase {
+    /// requested `--idle` seconds
     pub dur_s: f64,
+    /// actual wall-clock length of the measured window; `None` in files written
+    /// before it was recorded
+    pub measured_s: Option<f64>,
     /// how long it took the session to go quiet before sampling started
     pub settle_s: f64,
     pub mem_mib: f64,
@@ -74,8 +78,10 @@ pub struct IdlePhase {
     pub procs: usize,
     pub cpu_pct: f64,
     pub comp_cpu_pct: f64,
-    /// session CPU not attributable to the compositor or to this benchmark
-    pub other_cpu_pct: f64,
+    /// session CPU not attributable to the compositor process tree or to this
+    /// benchmark. `None` in files written before the field existed: a missing
+    /// measurement is not zero CPU.
+    pub other_cpu_pct: Option<f64>,
     pub wakeups_per_s: f64,
     pub comp_pss_mib: f64,
     /// null when RAPL is unreadable or the battery is not discharging
@@ -91,22 +97,39 @@ pub struct IdlePhase {
 pub struct WindowsPhase {
     pub extra: u32,
     pub settle_s: f64,
+    /// "same-process": the extra toplevels belong to this benchmark, so GTK's
+    /// buffer pool is shared and the client share is not a separate client's
+    /// footprint.
+    pub method: String,
+    /// second of two pre-open baselines
     pub baseline_mib: f64,
+    /// second baseline minus the first: how much the idle session moved while
+    /// the baseline was taken. `None` in files written before it was recorded.
+    pub baseline_drift_mib: Option<f64>,
     pub with_windows_mib: f64,
-    /// working set added by the extra toplevels
+    /// raw signed delta; negative means the session shrank, not that it grew
+    /// by zero
     pub delta_mib: f64,
+    /// false when the delta is negative or the baseline drifted too much
+    pub delta_valid: bool,
     /// GPU-accessible memory the benchmark's clients hold with the toplevels
     /// open, from DRM fdinfo. Buffers are pooled, so there is no useful delta.
     pub client_gpu_mib: f64,
     /// GPU-accessible memory the compositor holds at the same moment
     pub comp_gpu_mib: f64,
-    /// working set delta per extra toplevel
-    pub per_window_mib: f64,
-    /// share of the working set delta charged to the compositor's process tree
+    /// working set delta per extra toplevel; `None` when `delta_valid` is false
+    pub per_window_mib: Option<f64>,
+    /// signed share of the working set delta charged to the compositor's tree
     pub comp_delta_mib: f64,
-    /// the rest: the clients that were opened
+    /// the signed rest: the same-process clients that were opened
     pub client_delta_mib: f64,
+    /// memory still held after close, against the pre-open baseline (signed).
+    /// This keeps the v3 meaning of the field.
     pub residual_mib: f64,
+    /// drift between two post-close snapshots: the leak indicator, not the
+    /// buffer pool that the frame test grew. `None` in files written before it
+    /// was recorded.
+    pub post_close_drift_mib: Option<f64>,
 }
 
 /// One frame-timing scenario: a single animated surface, or that surface plus N
@@ -115,7 +138,11 @@ pub struct WindowsPhase {
 #[serde(default)]
 pub struct RenderPhase {
     pub scenario: String,
+    /// requested `--frames` seconds
     pub dur_s: f64,
+    /// actual wall-clock length of the measured window; `None` in files written
+    /// before it was recorded
+    pub measured_s: Option<f64>,
     /// frames the compositor actually presented
     pub frames: i64,
     pub dropped: i64,
@@ -130,14 +157,22 @@ pub struct RenderPhase {
     pub pacing_source: String,
     pub comp_ms_per_frame: f64,
     pub comp_ns_per_frame: f64,
-    /// estimated from DRM client counters; null when the driver exposes none
+    /// compositor GPU time per frame from DRM client counters. This keeps the
+    /// v3 meaning of the field; the client component is stored separately.
     pub gpu_ms_per_frame: Option<f64>,
+    /// compositor GPU time per frame, under an explicit name
+    pub comp_gpu_ms_per_frame: Option<f64>,
+    /// this benchmark's GPU time per frame from its own DRM client counters
+    pub app_gpu_ms_per_frame: Option<f64>,
     pub app_ms_per_frame: f64,
     pub session_cpu_s: f64,
-    /// this benchmark's own CPU time during the same window
-    pub self_cpu_s: f64,
-    /// `session_cpu_s - self_cpu_s`, the honest session figure
-    pub session_cpu_excl_self_s: f64,
+    /// this benchmark's own CPU time during the same window. `None` in files
+    /// written before the field was optional: a missing measurement is not a
+    /// free run.
+    pub self_cpu_s: Option<f64>,
+    /// `session_cpu_s - self_cpu_s`, the honest session figure. `None` when
+    /// `self_cpu_s` is missing.
+    pub session_cpu_excl_self_s: Option<f64>,
     /// RAPL/battery around the frame test; null when unreadable
     pub psys_w: Option<f64>,
     pub pkg_w: Option<f64>,
@@ -172,6 +207,65 @@ pub struct Check {
     pub detail: String,
 }
 
+/// One protocol in the run's coverage snapshot. `version` is what the
+/// compositor advertised, `since` is the lowest version that is actually
+/// useful, and `stale` means it advertised an older one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureItem {
+    pub name: String,
+    pub label: String,
+    pub tier: String,
+    pub version: Option<u32>,
+    pub since: u32,
+    pub stale: bool,
+}
+
+/// Protocol coverage at run time. `None` on the run means the scan failed;
+/// an empty block is not the same as "advertised nothing".
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Features {
+    /// advertised, including stale versions
+    pub supported: usize,
+    pub total: usize,
+    pub supported_all: usize,
+    pub total_all: usize,
+    /// globals the reference list does not know about
+    pub extra: usize,
+    /// advertised but below `since`
+    pub stale: usize,
+    pub percent: f64,
+    pub items: Vec<FeatureItem>,
+}
+
+impl Features {
+    pub fn from_scan(scan: &crate::wlscan::Features) -> Self {
+        let items: Vec<FeatureItem> = scan
+            .items
+            .iter()
+            .map(|item| FeatureItem {
+                name: item.feature.name.to_string(),
+                label: item.feature.label.to_string(),
+                tier: item.feature.tier.key().to_string(),
+                version: item.version,
+                since: item.feature.since,
+                stale: item.stale(),
+            })
+            .collect();
+        Self {
+            supported: scan.supported,
+            total: scan.total,
+            supported_all: scan.supported_all,
+            total_all: scan.total_all,
+            extra: scan.extra,
+            stale: scan.stale,
+            percent: scan.percent(),
+            items,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Run {
@@ -199,6 +293,8 @@ pub struct Run {
     pub clean: bool,
     pub contaminants: Vec<Contaminant>,
     pub env: Env,
+    /// protocol coverage at run time; `None` when the scan failed
+    pub features: Option<Features>,
     pub idle: Option<IdlePhase>,
     pub windows: Option<WindowsPhase>,
     pub render: Option<RenderPhase>,
@@ -373,7 +469,8 @@ const WINDOWS: Phase = Phase {
         ("client_gpu_mib", "client GPU", 0),
         ("comp_delta_mib", "comp delta", 1),
         ("comp_gpu_mib", "comp GPU", 0),
-        ("residual_mib", "residual", 0),
+        ("residual_mib", "residual", 1),
+        ("post_close_drift_mib", "post-close", 1),
         ("extra", "windows", 0),
     ],
     sort_by: "per_window_mib",
@@ -386,7 +483,8 @@ const RENDER: Phase = Phase {
         ("fps", "fps", 1),
         ("cadence_hz", "cadence Hz", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
-        ("gpu_ms_per_frame", "gpu ms/frame", 3),
+        ("gpu_ms_per_frame", "comp gpu", 3),
+        ("app_gpu_ms_per_frame", "client gpu", 3),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
@@ -403,7 +501,8 @@ const MULTI: Phase = Phase {
         ("fps", "fps", 1),
         ("cadence_hz", "cadence Hz", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
-        ("gpu_ms_per_frame", "gpu ms/frame", 3),
+        ("gpu_ms_per_frame", "comp gpu", 3),
+        ("app_gpu_ms_per_frame", "client gpu", 3),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
@@ -449,7 +548,7 @@ fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
                 "procs" => p.procs as f64,
                 "cpu_pct" => p.cpu_pct,
                 "comp_cpu_pct" => p.comp_cpu_pct,
-                "other_cpu_pct" => p.other_cpu_pct,
+                "other_cpu_pct" => p.other_cpu_pct?,
                 "wakeups_per_s" => p.wakeups_per_s,
                 "psys_w" => p.psys_w?,
                 "batt_w" => p.batt_w?,
@@ -459,12 +558,21 @@ fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
         "windows" => {
             let p = run.windows.as_ref()?;
             Some(match field {
-                "per_window_mib" => p.per_window_mib,
+                // A per-window number is only meaningful when the writer said
+                // the delta was valid. Old v3 files have no `delta_valid`, so
+                // their clamped 0.0 reads as not measured.
+                "per_window_mib" => {
+                    if !p.delta_valid {
+                        return None;
+                    }
+                    p.per_window_mib?
+                }
                 "delta_mib" => p.delta_mib,
                 "client_gpu_mib" => p.client_gpu_mib,
                 "comp_delta_mib" => p.comp_delta_mib,
                 "comp_gpu_mib" => p.comp_gpu_mib,
                 "residual_mib" => p.residual_mib,
+                "post_close_drift_mib" => p.post_close_drift_mib?,
                 "extra" => f64::from(p.extra),
                 _ => return None,
             })
@@ -480,6 +588,8 @@ fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
                 "cadence_hz" => p.cadence_hz,
                 "comp_ms_per_frame" => p.comp_ms_per_frame,
                 "gpu_ms_per_frame" => p.gpu_ms_per_frame?,
+                "comp_gpu_ms_per_frame" => p.comp_gpu_ms_per_frame?,
+                "app_gpu_ms_per_frame" => p.app_gpu_ms_per_frame?,
                 "p95_ms" => p.p95_ms,
                 "dropped" => p.dropped as f64,
                 "frames" => p.frames as f64,
@@ -806,12 +916,14 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
 
     println!(
         "\ncomp ms/frame = compositor CPU time per presented frame (lower = leaner).\n\
-         gpu ms/frame = per-client GPU time from DRM fdinfo (estimate, null without counters).\n\
+         comp gpu = compositor GPU time per frame; client gpu = this benchmark's, both from DRM fdinfo (estimate, null without counters).\n\
          RAM = anon+shmem working set: page cache follows what the session read, not what it costs.\n\
          dropped = missed frames against the observed cadence, not the panel's refresh rate.\n\
-         extra toplevels: ws/window is the working-set delta per window; client buffers are\n\
-         dmabufs, pooled by the client, so GPU memory is reported as a total, not per window.\n\
-         Medians with [min-max] when runs disagree by more than 2 %."
+         extra toplevels: ws/window is the signed working-set delta per window, omitted when the\n\
+         delta is negative or the baseline drifted; residual is what was not returned to the\n\
+         pre-open baseline; post-close is the drift between two post-close samples; client\n\
+         buffers are dmabufs, pooled by the client, so GPU memory is a total.\n\
+         Medians with [min-max] when runs disagree by more than 1 %."
     );
     Ok(())
 }
@@ -892,26 +1004,41 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
         for (field, _title, nd) in phase.columns {
             let sa = field_stats(&la, phase, field);
             let sb = field_stats(&lb, phase, field);
+            let (fa, fb) = (
+                sa.as_ref()
+                    .map(|s| fmt_value(s, *nd))
+                    .unwrap_or_else(|| "-".into()),
+                sb.as_ref()
+                    .map(|s| fmt_value(s, *nd))
+                    .unwrap_or_else(|| "-".into()),
+            );
             let (Some(sa), Some(sb)) = (sa, sb) else {
+                println!(
+                    "{:<26} {:>16} {:>16} {:>14}  not measured",
+                    format!("{}.{}", phase.key, field),
+                    fa,
+                    fb,
+                    "-"
+                );
                 continue;
             };
             let delta = sb.median - sa.median;
             let noise = sa.noise().max(sb.noise());
             let verdict = if delta.abs() <= noise {
                 format!("same (noise ±{noise:.nd$})")
+            } else if sa.median == 0.0 {
+                // A percentage against zero is not a percentage; report the
+                // absolute change instead of a fabricated +0 %.
+                format!("n/a (baseline 0, {:+.nd$})", delta)
             } else {
-                let pct = if sa.median != 0.0 {
-                    delta / sa.median * 100.0
-                } else {
-                    0.0
-                };
+                let pct = delta / sa.median * 100.0;
                 format!("{pct:+.0}%")
             };
             println!(
                 "{:<26} {:>16} {:>16} {:>+14.nd$}  {verdict}",
                 format!("{}.{}", phase.key, field),
-                fmt_value(&sa, *nd),
-                fmt_value(&sb, *nd),
+                fa,
+                fb,
                 delta
             );
         }
@@ -1007,6 +1134,79 @@ mod tests {
         assert_eq!(r.idle.unwrap().mem_mib, 700.0);
         assert!(r.render.is_none());
         assert_eq!(r.schema_version, 0);
+    }
+
+    #[test]
+    fn v3_fixture_without_new_fields_reads_as_missing_not_zero() {
+        let text = include_str!("../tests/fixtures/v3-missing-other-cpu.json");
+        let r: Run = serde_json::from_str(text).unwrap();
+        assert_eq!(r.schema_version, 3);
+
+        let idle = r.idle.clone().unwrap();
+        assert_eq!(idle.other_cpu_pct, None);
+        assert_eq!(idle.measured_s, None);
+        assert!(
+            cell(&r, &IDLE, "other_cpu_pct").is_none(),
+            "a v3 file without other_cpu_pct must print -, not 0.00"
+        );
+
+        let windows = r.windows.clone().unwrap();
+        assert!(!windows.delta_valid, "the old file never recorded validity");
+        assert_eq!(windows.baseline_drift_mib, None);
+        assert_eq!(windows.post_close_drift_mib, None);
+        assert!(
+            cell(&r, &WINDOWS, "per_window_mib").is_none(),
+            "a legacy clamped 0.0 must not read as a measured per-window cost"
+        );
+        assert!(cell(&r, &WINDOWS, "post_close_drift_mib").is_none());
+        assert_eq!(cell(&r, &WINDOWS, "delta_mib"), Some(0.0));
+        assert_eq!(
+            cell(&r, &WINDOWS, "residual_mib"),
+            Some(-2.0),
+            "residual_mib keeps its v3 meaning"
+        );
+
+        let render = r.render.clone().unwrap();
+        assert_eq!(render.self_cpu_s, None);
+        assert_eq!(render.session_cpu_excl_self_s, None);
+        assert!(r.features.is_none());
+    }
+
+    #[test]
+    fn features_block_keeps_stale_versions_separate() {
+        let globals = vec![
+            crate::wlscan::Global {
+                name: "wl_seat".into(),
+                version: 2,
+            },
+            crate::wlscan::Global {
+                name: "wl_compositor".into(),
+                version: 4,
+            },
+        ];
+        let block = Features::from_scan(&crate::wlscan::evaluate(&globals));
+        assert_eq!(block.stale, 1);
+        let seat = block.items.iter().find(|i| i.name == "wl_seat").unwrap();
+        assert_eq!(seat.version, Some(2));
+        assert!(seat.stale, "wl_seat 2 is below the useful version");
+        assert_eq!(seat.tier, "core");
+        assert_eq!(block.supported, 2, "advertised coverage includes stale");
+    }
+
+    #[test]
+    fn an_invalid_window_delta_has_no_per_window_number() {
+        let r = Run {
+            windows: Some(WindowsPhase {
+                extra: 2,
+                delta_mib: -28.2,
+                delta_valid: false,
+                per_window_mib: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cell(&r, &WINDOWS, "per_window_mib").is_none());
+        assert_eq!(cell(&r, &WINDOWS, "delta_mib"), Some(-28.2));
     }
 
     #[test]

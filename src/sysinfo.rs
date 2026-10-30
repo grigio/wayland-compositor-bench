@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +21,7 @@ pub fn read(path: &str) -> Option<String> {
 
 // ------------------------------------------------------------- snapshots ---
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     /// `memory.current`: the whole cgroup, page cache included
     pub total_mib: f64,
@@ -30,14 +31,17 @@ pub struct Snapshot {
     pub kernel_mib: f64,
     pub swap_mib: f64,
     pub cpu_usec: u64,
-    /// this process's own CPU time: the benchmark lives in the cgroup it measures
-    pub self_ns: u64,
     pub comp_ns: u64,
     /// compositor threads with their nanosecond CPU time, at sample time
     pub comp_tasks: Vec<proc::Task>,
     pub comp_wakeups: u64,
     pub procs: usize,
     pub comp_pss_mib: f64,
+    /// (pid, comm, CPU ns) for the session at the same instant as `cpu_usec`
+    pub cpu_procs: Vec<(u32, String, u64)>,
+    /// when the counters above were read; the wall-clock window is derived from
+    /// this, never from the requested CLI duration
+    pub at: Instant,
 }
 
 impl Snapshot {
@@ -48,22 +52,46 @@ impl Snapshot {
         self.anon_mib + self.shmem_mib
     }
 
+    /// One-shot snapshot for callers that only need a value at one instant.
+    /// It uses the start ordering, so the expensive scans are outside the
+    /// interval a subsequent snapshot will measure.
     pub fn take(comp_pid: Option<u32>) -> Self {
+        Self::begin(comp_pid)
+    }
+
+    /// Start of a measured window: scan first, then read the counters, then
+    /// timestamp. The scan is therefore *before* the window, not inside it.
+    pub fn begin(comp_pid: Option<u32>) -> Self {
         let dir = proc::session_cgroup();
-        // Cheap counters first: the scans below are the benchmark's own work
-        // and must not fall inside the interval this snapshot measures.
+        let mut snap = Self::take_light();
+        snap.procs = proc::pids_in_cgroup(dir).len();
+        snap.comp_pss_mib = comp_pid
+            .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
+            .unwrap_or(0.0);
+        snap.cpu_procs = proc::cpu_procs();
+        snap.comp_tasks = comp_pid.map(proc::tasks).unwrap_or_default();
+        snap.comp_ns = snap.comp_tasks.iter().map(|t| t.ns).sum();
+        snap.comp_wakeups = comp_pid.map(proc::process_wakeups).unwrap_or(0);
+        // Counters last: everything above is the benchmark's own work and is
+        // deliberately excluded from the interval.
+        snap.cpu_usec = proc::cpu_usage_usec(dir);
+        snap.at = Instant::now();
+        snap
+    }
+
+    /// End of a measured window: read the counters first, then scan, then keep
+    /// the timestamp taken before the scan. The scan is *after* the window.
+    pub fn end(comp_pid: Option<u32>) -> Self {
+        let dir = proc::session_cgroup();
         let cpu_usec = proc::cpu_usage_usec(dir);
-        let self_ns = proc::cpu_ns(std::process::id());
-        // One thread scan: `comp_ns` is the sum of the tasks we already have.
-        let comp_tasks = comp_pid.map(proc::tasks).unwrap_or_default();
-        let comp_ns = comp_tasks.iter().map(|t| t.ns).sum();
-        let comp_wakeups = comp_pid.map(|p| proc::status(p).wakeups).unwrap_or(0);
+        let at = Instant::now();
         let mut snap = Self::take_light();
         snap.cpu_usec = cpu_usec;
-        snap.self_ns = self_ns;
-        snap.comp_ns = comp_ns;
-        snap.comp_tasks = comp_tasks;
-        snap.comp_wakeups = comp_wakeups;
+        snap.at = at;
+        snap.cpu_procs = proc::cpu_procs();
+        snap.comp_tasks = comp_pid.map(proc::tasks).unwrap_or_default();
+        snap.comp_ns = snap.comp_tasks.iter().map(|t| t.ns).sum();
+        snap.comp_wakeups = comp_pid.map(proc::process_wakeups).unwrap_or(0);
         snap.procs = proc::pids_in_cgroup(dir).len();
         snap.comp_pss_mib = comp_pid
             .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
@@ -88,7 +116,22 @@ impl Snapshot {
                 .unwrap_or(0) as f64
                 / 1048576.0,
             cpu_usec: proc::cpu_usage_usec(dir),
-            ..Default::default()
+            comp_ns: 0,
+            comp_tasks: Vec::new(),
+            comp_wakeups: 0,
+            procs: 0,
+            comp_pss_mib: 0.0,
+            cpu_procs: Vec::new(),
+            at: Instant::now(),
+        }
+    }
+
+    /// Same cgroup total and per-process baseline as this snapshot, for
+    /// attribution over exactly this window rather than a nearby settle phase.
+    pub fn cpu_snapshot(&self) -> proc::CpuSnapshot {
+        proc::CpuSnapshot {
+            total_usec: self.cpu_usec,
+            procs: self.cpu_procs.clone(),
         }
     }
 
@@ -100,14 +143,6 @@ impl Snapshot {
         let cpu = after.cpu_usec.saturating_sub(self.cpu_usec) as f64 / 1e6 / seconds * 100.0;
         let comp = after.comp_ns.saturating_sub(self.comp_ns) as f64 / 1e9 / seconds * 100.0;
         (cpu, comp)
-    }
-
-    /// CPU % of one core spent by this process itself over the same window.
-    pub fn delta_self_cpu(&self, after: &Snapshot, seconds: f64) -> f64 {
-        if seconds <= 0.0 {
-            return 0.0;
-        }
-        after.self_ns.saturating_sub(self.self_ns) as f64 / 1e9 / seconds * 100.0
     }
 }
 
@@ -859,6 +894,19 @@ mod tests {
         assert!(s.working_set_mib() > 0.0);
         assert!(s.cpu_usec > 0);
         assert!(!s.working_set_mib().is_nan());
+    }
+
+    #[test]
+    fn begin_and_end_measure_the_actual_wall_clock() {
+        let a = Snapshot::begin(None);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let b = Snapshot::end(None);
+        let elapsed = b.at.saturating_duration_since(a.at).as_secs_f64();
+        assert!(elapsed >= 0.02, "elapsed was {elapsed:.3} s");
+        let (cpu, comp) = a.delta_cpu(&b, elapsed);
+        assert!(cpu.is_finite() && cpu >= 0.0);
+        assert_eq!(comp, 0.0, "no compositor pid was given");
+        assert!(b.cpu_usec >= a.cpu_usec);
     }
 
     #[test]

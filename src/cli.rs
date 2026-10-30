@@ -131,6 +131,9 @@ impl Options {
             }
         }
 
+        if !o.idle_s.is_finite() || !o.frames_s.is_finite() || !o.settle_s.is_finite() {
+            return Err("--idle, --frames and --settle must be finite numbers".into());
+        }
         if o.idle_s < 1.0 || o.frames_s < 1.0 {
             return Err("--idle and --frames must be at least 1 second".into());
         }
@@ -219,6 +222,20 @@ mod tests {
         assert!(
             Options::parse(["--compare".to_string(), "labwc".to_string()].into_iter()).is_err()
         );
+    }
+
+    #[test]
+    fn non_finite_durations_are_rejected() {
+        for flag in ["--idle", "--frames", "--settle"] {
+            assert!(
+                Options::parse([flag.to_string(), "NaN".to_string()].into_iter()).is_err(),
+                "{flag} NaN must not reach Duration::from_secs_f64"
+            );
+            assert!(
+                Options::parse([flag.to_string(), "inf".to_string()].into_iter()).is_err(),
+                "{flag} inf must not reach Duration::from_secs_f64"
+            );
+        }
     }
 
     #[test]

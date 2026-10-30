@@ -43,6 +43,7 @@ strip --remove-section=.comment --remove-section=.note --strip-unneeded \
   "$stage/usr/bin/$bin"
 
 install -Dm644 README.md "$stage/usr/share/doc/$pkg/README.md"
+install -Dm644 DESIGN.md "$stage/usr/share/doc/$pkg/DESIGN.md"
 gzip -9n -c CHANGELOG.md > "$stage/usr/share/doc/$pkg/changelog.gz"
 chmod 644 "$stage/usr/share/doc/$pkg/changelog.gz"
 

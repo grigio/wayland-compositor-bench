@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Reading {
@@ -18,26 +19,42 @@ pub struct Reading {
     max: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Sample {
     /// psys: CPU + iGPU + fabric, the best proxy for battery drain
     pub psys: Option<Reading>,
     /// package-0: CPU package only
     pub pkg: Option<Reading>,
+    /// when the counters were read, used instead of the requested phase length
+    pub at: Instant,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self {
+            psys: None,
+            pkg: None,
+            at: Instant::now(),
+        }
+    }
 }
 
 /// One reading of both RAPL domains. Cheap enough to call twice per phase.
 pub fn sample() -> Sample {
+    let at = Instant::now();
     let (psys, pkg) = domains();
     Sample {
+        at,
         psys: psys.as_ref().and_then(|d| d.read()),
         pkg: pkg.as_ref().and_then(|d| d.read()),
     }
 }
 
 /// Watts between two samples, or `None` when either side is missing or the
-/// window is too short to mean anything.
-pub fn delta(a: Sample, b: Sample, seconds: f64) -> (Option<f64>, Option<f64>) {
+/// actual measured window is too short to mean anything. The requested CLI
+/// duration is not used: sleeps and GTK's main loop both overshoot.
+pub fn delta(a: Sample, b: Sample) -> (Option<f64>, Option<f64>) {
+    let seconds = b.at.saturating_duration_since(a.at).as_secs_f64();
     if seconds < 0.5 {
         return (None, None);
     }
@@ -164,4 +181,49 @@ pub fn battery_watts() -> Option<f64> {
         .parse()
         .ok()?;
     Some(uw / 1e6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn reading(uj: u64, max: u64) -> Reading {
+        Reading { uj, max }
+    }
+
+    #[test]
+    fn watts_use_the_measured_interval_not_the_requested_one() {
+        let t0 = Instant::now();
+        let a = Sample {
+            psys: Some(reading(1_000_000, u64::MAX)),
+            pkg: Some(reading(500_000, u64::MAX)),
+            at: t0,
+        };
+        let b = Sample {
+            psys: Some(reading(3_000_000, u64::MAX)),
+            pkg: Some(reading(1_500_000, u64::MAX)),
+            at: t0 + Duration::from_secs(2),
+        };
+        // 2 J over 2 s = 1 W; 1 J over 2 s = 0.5 W
+        let (psys, pkg) = delta(a, b);
+        assert_eq!(psys, Some(1.0));
+        assert_eq!(pkg, Some(0.5));
+    }
+
+    #[test]
+    fn a_window_shorter_than_half_a_second_is_not_a_measurement() {
+        let t0 = Instant::now();
+        let a = Sample {
+            psys: Some(reading(0, u64::MAX)),
+            at: t0,
+            ..Default::default()
+        };
+        let b = Sample {
+            psys: Some(reading(1_000_000, u64::MAX)),
+            at: t0 + Duration::from_millis(400),
+            ..Default::default()
+        };
+        assert_eq!(delta(a, b), (None, None));
+    }
 }

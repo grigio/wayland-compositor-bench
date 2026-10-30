@@ -1,102 +1,187 @@
 # wayland-compositor-bench
 
 [![CI](https://github.com/grigio/wayland-compositor-bench/actions/workflows/ci.yml/badge.svg)](https://github.com/grigio/wayland-compositor-bench/actions/workflows/ci.yml)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 
 Measure the Wayland session you are logged into: how much memory and CPU the
 compositor costs at rest, what it costs per presented frame, and how much power
 the machine draws while it sits there. One Rust binary, no scripts, no Python.
 
-Tested on: Xiaomi Book Pro 14 (Core Ultra X7 358H, Arc B390, 3120x2080 eDP).
+![Wayland Compositor Bench in a GNOME 51 session: system info, six-axis radar, CPU timeline, RAM consumers and supported Wayland protocols](./wayland-compositor-bench.webp)
 
-## Quick start
+Share your *Wayland Compositor* benchmark online with the hashtag **#wcbench**.
 
-```bash
-cargo build --release
+## Highlights
 
-./target/release/wayland-compositor-bench                 # window, press Start
-./target/release/wayland-compositor-bench --check         # can this session be measured?
-./target/release/wayland-compositor-bench --run --json
-```
+- **The real session, not a sandbox.** It measures the compositor you are
+  actually running, with your apps, portals and configuration.
+- **Costs are attributed.** Compositor CPU, RAM, GPU time and wakeups are
+  separated from the benchmark client and from the rest of the session; power is
+  sampled for the whole machine.
+- **Claims come with evidence.** Every run carries a confidence level, and
+  `--compare` refuses to call a difference smaller than the observed noise.
+- **Raw data stays raw.** The JSON keeps the 100 ms CPU timeline, phase marks,
+  protocol versions and every check behind the confidence.
 
-The `blur:` chip next to Start reports whether the compositor advertises
-`ext-background-effect-v1` and doubles as a switch: click it to drop the
-translucent, blurred window background for a plain opaque one. Blur is a real
-cost for the compositor, so the switch makes runs comparable between
-compositors that blur and ones that do not.
+<details>
+<summary>Contents</summary>
 
-`--run` measures immediately and **exits when done**, so it can sit in a script;
-it exits non-zero if the JSON cannot be written. The JSON lands in
-`$XDG_STATE_HOME/wayland-compositor-bench/results/`
-(`~/.local/state/...` by default); the label defaults to the desktop the
-running compositor belongs to (`GNOME`, `labwc`, …), falling back to
-`XDG_CURRENT_DESKTOP` when the two agree, so a session flavour like
-`ubuntu:GNOME` is kept (`--label` to override).
+- [Install](#install)
+- [Quick start](#quick-start)
+- [The window](#the-window)
+- [Commands and options](#commands-and-options)
+- [What it measures](#what-it-measures)
+- [Reading the numbers](#reading-the-numbers)
+- [Making runs comparable](#making-runs-comparable)
+- [Power readings](#power-readings)
+- [Troubleshooting](#troubleshooting)
+- [What this does not measure](#what-this-does-not-measure)
+- [Development](#development)
+- [Documentation](#documentation)
+- [License](#license)
+- [Donations](#donations)
 
-Log out, log into the next compositor, run it again. Three runs per compositor:
-the difference between identical runs is usually bigger than the one you are
-chasing.
+</details>
 
-```bash
-./target/release/wayland-compositor-bench --report              # medians of saved runs
-./target/release/wayland-compositor-bench --report ~/runs/labwc # a directory, files, or labels
-./target/release/wayland-compositor-bench --compare labwc gnome # side by side, with a noise floor
-./target/release/wayland-compositor-bench --compare labwc gnome ~/runs # …reading a directory
-```
+## Install
 
-With no path, `--report` reads the XDG results directory **and** `./results`, so
-runs made from the repository keep working. `--check` exits `2` when the session
-is measurable only with caveats, so a script can gate on it.
+Runs on Linux inside a Wayland session; there is no X11 mode. Session-wide
+figures need cgroup v2, and power needs RAPL or a battery — `--check` reports
+anything this machine cannot provide before you measure.
 
-Flags: `--idle S` (20), `--frames S` per frame test (6), `--windows N` (6),
-`--settle S` max wait for quiet (45). `--help` for the rest.
+### Released packages
 
-## Packages
-
-Tagged releases carry the Linux binary, an Arch package and a Debian package,
-plus the source tarball and `SHA256SUMS`:
+[Tagged releases](https://github.com/grigio/wayland-compositor-bench/releases)
+include the Linux binary, an Arch package, a Debian package, the source tarball
+and `SHA256SUMS`. Download the one for your distro, then:
 
 ```bash
 sudo pacman -U wayland-compositor-bench-*.pkg.tar.zst     # Arch
 sudo apt install ./wayland-compositor-bench_*_amd64.deb   # Debian / Ubuntu
 ```
 
-Both packages install `/usr/bin/wayland-compositor-bench` plus a `.desktop`
-launcher and a hicolor icon, so it also appears in the application menu. The
-Debian package is built on Debian 13 (GTK 4.18) so the dependency floor is
-honest; the Arch package is built by `PKGBUILD` in the repository root.
+Both packages install `/usr/bin/wayland-compositor-bench`, a `.desktop` launcher
+and a hicolor icon, so the tool also appears in the application menu. The Debian
+package is built on Debian 13 (GTK 4.18) so the dependency floor is honest; the
+Arch package is built by `PKGBUILD` in the repository root.
+
+### From source
+
+To build you need Rust 1.92 or newer and GTK 4.16+ development headers
+(`backdrop-filter` is used by the window CSS); to run the tool you need a
+Wayland session:
+
+```bash
+# Arch
+sudo pacman -S --needed rust gtk4 pkgconf wayland
+
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config libgtk-4-dev libwayland-dev
+
+git clone https://github.com/grigio/wayland-compositor-bench
+cd wayland-compositor-bench
+cargo build --release --locked
+```
+
+The binary is `target/release/wayland-compositor-bench`; install it anywhere on
+your `PATH`.
+
+## Quick start
+
+```bash
+wayland-compositor-bench --check          # can this session be measured?
+wayland-compositor-bench                  # window, press Start
+wayland-compositor-bench --run --json     # measure, save the result, exit
+```
+
+If you built from the checkout, use `./target/release/wayland-compositor-bench`
+instead.
+
+The `blur:` chip next to Start reports whether the compositor advertises
+`ext-background-effect-v1` and doubles as a switch: click it to drop the
+translucent, blurred window background for a plain opaque one. Blur is real
+compositor work, so the switch makes runs comparable between compositors that
+blur and ones that do not.
+
+`--run` measures as soon as the window is up and **exits when done**, so it can
+sit in a script. Add `--json` to save the run: results land in
+`$XDG_STATE_HOME/wayland-compositor-bench/results/` (`~/.local/state/...` by
+default), or at `--json FILE`. The command exits non-zero if the JSON cannot be
+written. The label defaults to the desktop the running compositor belongs to
+(`GNOME`, `labwc`, …), keeping a session flavour when the environment agrees
+with the compositor (`ubuntu:GNOME` becomes `ubuntu-gnome`); use `--label` to
+override it.
+
+Log out, log into the next compositor, run it again. Do **three runs per
+compositor**: the difference between identical runs is usually bigger than the
+one you are chasing.
+
+## The window
+
+- **Live system info:** session identity, compositor version, hardware, power
+  profile and current CPU/RAM/GPU counters.
+- **Six-axis radar:** pacing on one surface and under load, render cost,
+  compositor RAM and idle CPU, and protocol coverage, each relative to what the
+  run and this machine establish. Hover a label for what the axis plots and
+  which direction is better.
+- **Pre-run access check:** before the first run the placeholder lists any
+  metric this machine cannot provide — cgroup v1 or a missing session scope,
+  unreadable RAPL, a `hidepid` `/proc`, a missing `schedstat` or PSI — with the
+  path and the fix. A green tick says the check passed and every source is
+  readable; a red cross names the ones that are not. `--check` prints the same
+  probe in more detail.
+- **CPU timeline:** the session CPU during the run, with phase marks, so you can
+  see *when* it got busy instead of only how busy it got.
+- **`TOP RAM CONSUMERS`:** a snapshot of the machine's memory when the window
+  opened, grouped by process name.
+- **`WAYLAND FEATURES SUPPORTED`:** every registry global with its version,
+  grouped by tier.
+
+## Commands and options
+
+```bash
+wayland-compositor-bench --report              # medians of saved runs
+wayland-compositor-bench --report ~/runs/labwc # a directory, files, or labels
+wayland-compositor-bench --compare labwc gnome # side by side, with a noise floor
+wayland-compositor-bench --compare labwc gnome ~/runs
+```
+
+With no path, `--report` reads the XDG results directory **and** `./results`, so
+runs made from the repository keep working. Paths may be directories, JSON files
+or label substrings.
+
+`--compare` accounts for the observed run-to-run spread and refuses to call a
+difference smaller than the noise. `--check` exits `2` when the session is
+measurable only with caveats, so a script can gate on it.
+
+| option | default | what it does |
+|---|---|---|
+| `--run` | off | start measuring as soon as the window is up |
+| `--json [FILE]` | auto file | write the finished run; implies `--run` |
+| `--label NAME` | running desktop | name the run |
+| `--idle S` | 20 | idle sampling window |
+| `--frames S` | 6 | length of each frame test |
+| `--windows N` | 6 | extra animated toplevels |
+| `--settle S` | 45 | maximum wait for the session to go quiet |
+
+Environment variables: `WG_BENCH_AUTORUN=1` (same as `--run`),
+`WG_BENCH_PRINT=1` (echo result rows to stdout), `WG_BENCH_NO_SUDO=1` (never use
+`sudo -n` for RAPL). See `--help` for the rest.
 
 ## What it measures
 
 | phase | what you get |
 |---|---|
-| **idle** | session working set, compositor PSS, session and compositor CPU, attributed other CPU, compositor wakeups/s, package and battery power |
-| **toplevels** | the same session with N extra windows open: working set delta, GPU memory held by client and compositor |
-| **frames (single)** | one animated surface: fps, cadence, p50/p95/max interval, missed frames, compositor CPU/frame, GPU/frame, app CPU/frame, package and battery power for the test |
+| **idle** | session working set, compositor PSS, session and compositor CPU, attributed other CPU, process-wide compositor wakeups/s, package and battery power |
+| **toplevels** | the same session with N extra windows open: signed working-set delta against a double-sampled baseline, per-window only when the delta is valid, GPU memory held by client and compositor, and post-close drift |
+| **frames (single)** | one animated surface: fps, cadence, p50/p95/max interval, missed frames, compositor CPU/frame, GPU/frame (compositor + client), app CPU/frame, package and battery power for the test |
 | **frames (multi)** | the same surface plus N animated toplevels — what a real desktop does all day |
-| **protocols** | every `wl_registry` global with its version, grouped by tier |
+| **protocols** | every `wl_registry` global with its version, grouped by tier; the whole snapshot is saved in the run JSON, including stale versions |
 | **peaks** | 25 ms sampler for RAM and CPU spikes during the run; the 100 ms CPU timeline and phase marks are saved in the JSON |
 
-Everything is read from `/proc`, the session's cgroup v2 and sysfs:
-
-- **CPU** from `schedstat` in nanoseconds, summed over threads — not
-  `utime+stime`, which is quantised to 10 ms ticks and cannot see a lean
-  compositor at 120 Hz.
-- **Frame intervals, fps and drops** from `presentation_time`: when the frame
-  was actually scanned out, not when the client painted it.
-- **GPU time** from the DRM client counters in `/proc/<pid>/fdinfo`, scaled by
-  the busy/total cycle ratio. Deduplicated per `drm-client-id`: several fds of
-  one client report identical numbers.
-- **The compositor** is the process holding the `WAYLAND_DISPLAY` listening
-  socket, resolved through `/proc/net/unix` and `/proc/*/fd`. Name matching
-  picks the wrong process as soon as a nested compositor is running.
-- **The desktop** is derived from that process, not from
-  `XDG_CURRENT_DESKTOP`: GNOME Shell is a systemd user service, so it inherits
-  the user manager's environment and can still claim the desktop you logged out
-  of. A stale environment is recorded as a failed check and reported, never used
-  to name the run.
-- **Memory** as `anon + shmem` (the working set). Page cache is excluded: it
-  follows what the session read, not what the desktop costs. GPU buffers are
-  reported separately, because dmabufs never enter the cgroup.
+All measurements come from `/proc`, the session's cgroup v2 and sysfs. The exact
+source of each figure, the session/cgroup resolution rules and the measurement
+window ordering are documented in [DESIGN.md](DESIGN.md#measurement-model).
 
 ## Reading the numbers
 
@@ -109,13 +194,23 @@ Everything is read from `/proc`, the session's cgroup v2 and sysfs:
 - `fps` next to `cadence`: 60 fps at a 60 Hz cadence on a 120 Hz panel means the
   scene is too heavy for 120, **not** that frames are being dropped. Drops are
   counted against the observed cadence for that reason.
-- `RAM` is the working set, so a desktop that read 2 GiB of files does not look
-  worse than one that read nothing.
+- `RAM` is the working set (`anon + shmem`), so a desktop that read 2 GiB of
+  files does not look worse than one that read nothing.
 - `psys` is the whole SoC (CPU + iGPU + fabric) — the best battery proxy. `pkg`
   is the CPU package alone, `bat` is what the battery reports.
-- `other CPU` is session CPU that is neither the compositor nor this tool. A
-  `quiet cpu` check fails above 5 % and names the top offenders, so an
-  unexplained idle figure comes with a diagnosis.
+- `other CPU` is session CPU outside the compositor process tree and this tool.
+  A `quiet cpu` check fails above 5 % and names the top offenders from the same
+  idle window and the same exclusion set, so an unexplained idle figure comes
+  with a diagnosis. A process that started during the window is not charged its
+  whole lifetime CPU.
+- `wakeups/s` is process-wide: it sums every thread's context switches, not just
+  the thread-group leader.
+- GPU time is reported for the compositor and the benchmark client separately;
+  the report shows both columns and the JSON keeps the two components.
+- Extra-toplevel memory keeps the signed delta. `per-window` is left empty when
+  the delta is negative or the baseline moved, and the JSON labels the method
+  `same-process GTK toplevels` because the extra windows share this process's
+  GTK buffer pool.
 - Coverage counts only the **Core / Rendering / Desktop** tiers. wlroots-only
   and optional protocols are listed with their versions but not scored;
   otherwise the number rewards a design choice.
@@ -123,11 +218,13 @@ Everything is read from `/proc`, the session's cgroup v2 and sysfs:
   without its trade-offs; read the axes.
 
 Every run carries a `confidence` of `high`, `medium` or `low`, derived from
-checks stored in the JSON: session scope found, compositor resolved by socket,
+checks stored in the JSON: session cgroup resolved, compositor resolved by socket,
 presentation feedback, display refresh known, session clean, quiet CPU. When
-`--json` writes a run it also stores the 100 ms CPU timeline and its phase
-marks, so spike patterns survive the medians. `--report` prints the failing
-checks and warns when a label mixes blur states.
+`--json` writes a run it also stores the 100 ms CPU timeline and its phase marks,
+so spike patterns survive the medians. `--report` prints the failing checks and
+warns when a label mixes blur states or other incomparable context. The check
+list and confidence rules are in
+[DESIGN.md](DESIGN.md#checks-and-confidence).
 
 ## Making runs comparable
 
@@ -145,14 +242,14 @@ checks and warns when a label mixes blur states.
 5. **Compare within a tier.** labwc is a WM; GNOME is a WM plus a shell, search,
    notifications and portals. Measure bare sessions and full desktops, and say
    which one you are reporting.
-6. **Three runs, and use `--compare`.** It subtracts the observed spread and
+6. **Three runs, and use `--compare`.** It accounts for the observed spread and
    refuses to call a difference smaller than the noise.
 
 The benchmark's own window is a real client: it counts toward the compositor's
 cost. That is intentional — it is the only way to animate something the
 compositor must composite.
 
-## Permissions
+## Power readings
 
 RAPL `energy_uj` is `0400 root` on most distros. Power is optional and no
 measurement requires root: when the file is not world-readable the tool tries a
@@ -173,6 +270,18 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=powercap
 `--check` says whether RAPL is readable. Without it, power columns are `null`,
 not zero.
 
+## Troubleshooting
+
+- Run `--check` first: it prints the session, compositor, display, power and
+  system details, plus the heavy processes that would make a run noisy.
+- Exit code `0` means measurable; exit code `2` means measurable with caveats
+  (for example unreadable RAPL or a busy session). The reasons are printed.
+- `--report` prints the failing checks behind a `medium` or `low` confidence,
+  and warns when saved runs differ in display, config, blur state or session
+  scope.
+- If `WAYLAND_DISPLAY` is unset, start the tool from inside a Wayland session.
+- If power is `null`, follow [Power readings](#power-readings).
+
 ## What this does not measure
 
 - **Input-to-photon latency.** Needs a photodiode or evdev injection plus
@@ -188,13 +297,33 @@ not zero.
 - **XWayland** clients and the cost of the X server.
 - **Power on machines with no battery and no readable RAPL.**
 
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
+
+The tests run headless. `makepkg -si` builds the Arch package from the checkout;
+`packaging/build-deb.sh` builds the Debian package on Debian 13. Issues and pull
+requests are welcome.
+
+## Documentation
+
+- [DESIGN.md](DESIGN.md) — architecture, measurement model, JSON schema,
+  reporting statistics, tests and release tooling.
+- [CHANGELOG.md](CHANGELOG.md) — release history.
+
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
 
 ## Donations
 
-If you find this project helpful, please consider making a donation to support its development.
+If you find this project helpful, please consider making a donation to support
+its development.
 
 - **Monero**: `88LyqYXn4LdCVDtPWKuton9hJwbo8ZduNEGuARHGdeSJ79BBYWGpMQR8VGWxGDKtTLLM6E9MJm8RvW9VMUgCcSXu19L9FSv`
 - **Bitcoin**: `bc1q6mh77hfv8x8pa0clzskw6ndysujmr78j6se025`
