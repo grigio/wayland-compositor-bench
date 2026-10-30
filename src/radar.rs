@@ -8,9 +8,10 @@
 //! - memory before the test and its peak while it ran, against the machine's
 //!   total RAM (`1 - ln(1 + MiB) / ln(1 + total)`), which keeps 80 MiB and
 //!   1.2 GiB visibly apart instead of both hugging the outer ring;
-//! - CPU idle before the test and its peak while it ran, against the machine's
-//!   full capacity (`threads * 100 %`), also logarithmically: the interesting
-//!   idle range is 0.3–3 % and a linear axis would squash it into a pixel.
+//! - CPU idle before the test and its average while it ran, against the
+//!   machine's full capacity (`threads * 100 %`), also logarithmically: the
+//!   interesting idle range is 0.3–3 % and a linear axis would squash it into a
+//!   pixel.
 //!
 //! The absolute number is printed at each vertex — that is what you quote.
 
@@ -50,7 +51,7 @@ const TITLES: [&str; 6] = [
     "RAM PEAK",
     "FEATURES",
     "CPU IDLE",
-    "CPU PEAK",
+    "CPU AVG",
 ];
 const COLORS: [(f64, f64, f64); 6] = [
     (0.42, 0.62, 1.00), // blue    frame rate
@@ -58,7 +59,7 @@ const COLORS: [(f64, f64, f64); 6] = [
     (0.20, 0.78, 0.64), // teal    RAM peak
     (0.72, 0.55, 1.00), // violet  features
     (0.96, 0.72, 0.30), // amber   CPU idle
-    (0.96, 0.46, 0.46), // red     CPU peak
+    (0.96, 0.46, 0.46), // red     CPU average
 ];
 
 /// What the chart plots. Everything is expressed in the unit you would quote.
@@ -70,7 +71,7 @@ pub struct Values {
     pub ram_before_mib: f64,
     pub ram_peak_mib: f64,
     pub cpu_idle_pct: f64,
-    pub cpu_peak_pct: f64,
+    pub cpu_avg_pct: f64,
 }
 
 pub struct Radar {
@@ -88,7 +89,10 @@ impl Radar {
     pub fn new(limits: Limits) -> Self {
         let area = gtk::DrawingArea::new();
         area.set_content_width(360);
-        area.set_content_height(270);
+        // Just tall enough for the ring plus the label lines above it and the
+        // air below: the version line sits right under the chart, not under a
+        // band of empty pixels.
+        area.set_content_height(228);
         area.set_hexpand(true);
         area.set_halign(gtk::Align::Fill);
 
@@ -123,7 +127,7 @@ impl Radar {
             ram_norm(v.ram_peak_mib, l.total_ram_mib),
             (v.feat_pct / 100.0).clamp(0.0, 1.0),
             cpu_norm(v.cpu_idle_pct, l.cpu_capacity_pct),
-            cpu_norm(v.cpu_peak_pct, l.cpu_capacity_pct),
+            cpu_norm(v.cpu_avg_pct, l.cpu_capacity_pct),
         ]);
 
         {
@@ -137,7 +141,7 @@ impl Radar {
             t[2] = crate::sysinfo::fmt_mib(v.ram_peak_mib);
             t[3] = format!("{:.0}%", v.feat_pct);
             t[4] = crate::sysinfo::fmt_pct(v.cpu_idle_pct);
-            t[5] = crate::sysinfo::fmt_pct(v.cpu_peak_pct);
+            t[5] = crate::sysinfo::fmt_pct(v.cpu_avg_pct);
         }
 
         // Start a fresh grow-in and cancel any in-flight animation.
@@ -211,11 +215,18 @@ fn draw(
     grow: f64,
 ) {
     let n = values.len();
-    let size = w.min(h);
     let cx = w / 2.0;
-    let cy = h / 2.0 - size * 0.02;
-    // Leave room for the two label lines that sit above and below the ring.
-    let r = (size * 0.30).min(h / 2.0 - 48.0).max(40.0);
+    // The two label lines of a top/bottom vertex are drawn *above* their vertex,
+    // so the ring needs room up there but only a little air underneath. Centring
+    // it with the same band on both sides left ~50 px of nothing below the chart,
+    // which is what pushed the version line away from it.
+    const LABEL_TOP: f64 = 30.0;
+    const LABEL_BOTTOM: f64 = 18.0;
+    // Side labels need their width too: never let the ring reach the card edge.
+    let r = (w / 2.0 - 96.0)
+        .min((h - LABEL_TOP - LABEL_BOTTOM) / 2.0)
+        .max(40.0);
+    let cy = h - LABEL_BOTTOM - r;
 
     // ------------------------------------------------------------- grid -----
     cr.set_line_width(1.0);

@@ -1,8 +1,10 @@
 mod bench;
 mod cli;
+mod cpuchart;
 mod power;
 mod proc;
 mod radar;
+mod ramchart;
 mod report;
 mod sysinfo;
 mod wlscan;
@@ -54,6 +56,15 @@ window.wbg, window.wbg.background { background-color: transparent; }
     padding: 12px 14px;
 }
 .panel .section { margin-top: 0; margin-bottom: 4px; }
+.ram-item {
+    font-size: 11px; color: rgba(255,255,255,0.86);
+    background-color: rgba(255,255,255,0.05);
+    border-radius: 6px; padding: 1px 7px;
+}
+.ram-item.on {
+    background-color: rgba(255,255,255,0.17);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.38);
+}
 .stat-title { font-size: 11px; font-weight: 700; letter-spacing: 0.10em; color: rgba(255,255,255,0.45); }
 .stat-big { font-size: 31px; font-weight: 800; color: #ffffff; }
 .stat-sub { font-size: 12px; color: rgba(255,255,255,0.45); }
@@ -282,6 +293,8 @@ fn set_blur_chip(chip: &gtk::Button, state: wlscan::BlurState, off: bool) {
 struct SummaryUi {
     root: gtk::Box,
     radar: Rc<radar::Radar>,
+    /// CPU over time, directly under the radar
+    chart: Rc<cpuchart::Chart>,
     comp: gtk::Label,
     /// one-line protocol coverage, shown above the always-visible feature list
     feat_label: gtk::Label,
@@ -309,8 +322,13 @@ impl SummaryUi {
         version.add_css_class("version");
         root.append(&version);
 
+        // the same CPU samples as the radar, but across the run instead of at a
+        // single peak: a low strip, no axes furniture beyond the three ticks
+        let chart = Rc::new(cpuchart::Chart::new());
+        root.append(&chart.area);
+
         let hint = gtk::Label::new(Some(
-            "further out is better · fps vs panel refresh · RAM and CPU vs what the system has (log axes) · peaks sampled during the run",
+            "further out is better · fps vs panel refresh · RAM and CPU vs what the system has (log axes) · RAM peak and CPU average during the run",
         ));
         hint.set_xalign(0.0);
         hint.set_wrap(true);
@@ -366,6 +384,7 @@ impl SummaryUi {
         Self {
             root,
             radar,
+            chart,
             comp,
             feat_label,
             feats,
@@ -382,8 +401,9 @@ impl SummaryUi {
             ram_before_mib: s.ram_mib,
             ram_peak_mib: s.ram_peak_mib,
             cpu_idle_pct: s.cpu_pct,
-            cpu_peak_pct: s.cpu_peak_pct,
+            cpu_avg_pct: s.cpu_avg_pct,
         });
+        self.chart.set(&s.cpu_series, &s.cpu_marks);
         let gpu = s
             .gpu_ms_per_frame
             .map(|g| format!(" · {g:.3} ms GPU"))
@@ -511,11 +531,16 @@ fn check() -> glib::ExitCode {
     }
     match &comp {
         Some(c) => {
-            let version = proc::compositor_version(&c.name)
-                .map(|v| format!(" · {v}"))
-                .unwrap_or_default();
+            // The same string as the window's `Wayland compositor` row, so a
+            // terminal check and a screenshot cannot disagree.
+            let version = proc::compositor_version(&c.name);
+            let line = compositor_identity(
+                proc::compositor_impl(&c.name),
+                version.as_deref(),
+                &pretty_desktop(&desktop.name),
+            );
             println!(
-                "  compositor       {} (pid {}, via {}){version}",
+                "  compositor       {line} ({} pid {}, via {})",
                 c.name, c.pid, c.source
             );
             if c.source != "socket" {
@@ -751,7 +776,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
         .application(app)
         .title("Wayland Compositor Bench")
         .default_width(900)
-        .default_height(833)
+        .default_height(1000)
         .decorated(false)
         .build();
     window.add_css_class("wbg");
@@ -891,6 +916,31 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     top.append(&basic_col);
     top.append(&stack);
     card.append(&top);
+
+    // ------------------------------------------------------ ram snapshot ---
+    // Full width under the two panels: what was holding memory when the window
+    // opened. Taken once, here — a benchmark run must not change the picture.
+    let ram_items = proc::ram_by_name();
+    let ram_total: f64 = ram_items.iter().map(|(_, mib)| *mib).sum();
+    let ram_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    ram_box.add_css_class("panel");
+    let ram_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let ram_title = gtk::Label::new(Some("TOP RAM CONSUMERS"));
+    ram_title.set_xalign(0.0);
+    ram_title.add_css_class("section");
+    ram_title.set_hexpand(true);
+    let ram_meta = gtk::Label::new(Some(&format!(
+        "at launch · RSS grouped by process name · {} names · {:.1} GiB",
+        ram_items.len(),
+        ram_total / 1024.0
+    )));
+    ram_meta.set_xalign(1.0);
+    ram_meta.add_css_class("stat-sub");
+    ram_head.append(&ram_title);
+    ram_head.append(&ram_meta);
+    ram_box.append(&ram_head);
+    ram_box.append(&ramchart::Chart::new(&ram_items).root);
+    card.append(&ram_box);
 
     // drag to move (undecorated) — only on the title block, so clicks on
     // Start/Restart and the close button are never swallowed by a move grab
@@ -1122,6 +1172,18 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     // switch from another desktop, so the variable alone is not reliable.
     let desktop = proc::desktop(comp.as_ref());
     let desktop_line = pretty_desktop(&desktop.name);
+    // One `--version` run feeds both the row and its tooltip.
+    let version_line = comp
+        .as_ref()
+        .and_then(|c| proc::compositor_version(&c.name));
+    let compositor_line = match comp.as_ref() {
+        Some(c) => compositor_identity(
+            proc::compositor_impl(&c.name),
+            version_line.as_deref(),
+            &desktop_line,
+        ),
+        None => desktop_line.clone(),
+    };
     let desktop_tip = desktop.mismatch().then(|| {
         format!(
             "XDG_CURRENT_DESKTOP={} is left over from another session; the Wayland socket \
@@ -1132,6 +1194,16 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
                 .unwrap_or("an unknown process")
         )
     });
+    let comp_tip = {
+        let mut tips = Vec::new();
+        if let (Some(c), Some(v)) = (comp.as_ref(), version_line.as_deref()) {
+            tips.push(format!("{} --version: {v}", c.name));
+        }
+        if let Some(t) = &desktop_tip {
+            tips.push(t.clone());
+        }
+        (!tips.is_empty()).then(|| tips.join("\n"))
+    };
 
     let perf_tip = performance_tip();
     let labels_c = labels.clone();
@@ -1139,8 +1211,8 @@ fn build_ui(app: &gtk::Application, opts: cli::Options) {
     let comp_line_c = comp_line.clone();
     let perf_tip_c = perf_tip.clone();
     let update = move |labels: &Labels, monitor: &Option<gtk::gdk::Monitor>| {
-        set(labels, "Wayland compositor", &desktop_line);
-        if let Some(tip) = &desktop_tip {
+        set(labels, "Wayland compositor", &compositor_line);
+        if let Some(tip) = &comp_tip {
             if let Some(l) = labels.get("Wayland compositor") {
                 l.set_tooltip_text(Some(tip));
             }
@@ -1362,6 +1434,39 @@ fn pretty_desktop(v: &str) -> String {
     }
 }
 
+/// `Mutter 51.1 · GNOME`: the software that composites, its release, and the
+/// desktop the session belongs to. A standalone compositor is its own desktop,
+/// so `sway 1.11 · sway` collapses to `sway 1.11`, and `labwc · wlroots` keeps
+/// only the part that adds information. A session flavour that is just the
+/// compositor's own name (`cosmic-comp-traffic`) is dropped too: the row
+/// already starts with it.
+fn compositor_identity(name: &str, version_line: Option<&str>, desktop: &str) -> String {
+    let mut line = match version_line.and_then(proc::version_token) {
+        Some(v) => format!("{name} {v}"),
+        None => name.to_string(),
+    };
+    let desktop = if desktop == "—" { "" } else { desktop };
+    let parts: Vec<&str> = desktop
+        .split(" · ")
+        .filter(|p| !p.is_empty() && !names_the_compositor(p, name))
+        .collect();
+    if !parts.is_empty() {
+        line.push_str(" · ");
+        line.push_str(&parts.join(" · "));
+    }
+    line
+}
+
+/// True for `sway` next to `sway`, and for `cosmic-comp-traffic` next to
+/// `cosmic-comp`; not for `GNOME` next to `Mutter` or `ubuntu` next to `GNOME`.
+fn names_the_compositor(part: &str, name: &str) -> bool {
+    let (part, name) = (part.to_ascii_lowercase(), name.to_ascii_lowercase());
+    part == name
+        || part
+            .strip_prefix(&name)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with(' '))
+}
+
 /// The window is undecorated, so give the compositor drag handles on all eight
 /// edges. Each handle is a transparent widget that starts an interactive resize
 /// on drag; without these the only way to resize is a keyboard shortcut.
@@ -1460,5 +1565,63 @@ fn add_resize_grips(overlay: &gtk::Overlay, window: &gtk::ApplicationWindow) {
         });
         area.add_controller(drag);
         overlay.add_overlay(&area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_compositor_row_names_the_implementation_and_the_desktop() {
+        // Mutter is a library inside GNOME Shell: the row must not say
+        // "GNOME" alone, which is the desktop, nor "gnome-shell", which is
+        // the process.
+        assert_eq!(
+            compositor_identity("Mutter", Some("GNOME Shell 51.1"), "GNOME"),
+            "Mutter 51.1 · GNOME"
+        );
+        assert_eq!(
+            compositor_identity("KWin", Some("kwin 6.4.5"), "KDE Plasma"),
+            "KWin 6.4.5 · KDE Plasma"
+        );
+        assert_eq!(
+            compositor_identity("cosmic-comp", Some("cosmic-comp 1.0.0"), "COSMIC"),
+            "cosmic-comp 1.0.0 · COSMIC"
+        );
+    }
+
+    #[test]
+    fn a_standalone_compositor_does_not_name_its_desktop_twice() {
+        assert_eq!(
+            compositor_identity("sway", Some("sway version 1.11"), "sway"),
+            "sway 1.11"
+        );
+        assert_eq!(compositor_identity("labwc", None, "labwc"), "labwc");
+        assert_eq!(
+            compositor_identity("labwc", None, "labwc · wlroots"),
+            "labwc · wlroots"
+        );
+        // the session flavour is the compositor's own name: the row already
+        // starts with the implementation, so it adds nothing
+        assert_eq!(
+            compositor_identity(
+                "cosmic-comp",
+                Some("cosmic-comp 1.0.0 (git commit 8cb1802)"),
+                "cosmic-comp-traffic · COSMIC"
+            ),
+            "cosmic-comp 1.0.0 · COSMIC"
+        );
+        // …but a desktop that merely resembles the name is kept
+        assert_eq!(compositor_identity("sway", None, "swayfx"), "sway · swayfx");
+    }
+
+    #[test]
+    fn an_unknown_session_keeps_the_desktop_it_has() {
+        assert_eq!(
+            compositor_identity("Mutter", Some("GNOME Shell 51.1"), "ubuntu · GNOME"),
+            "Mutter 51.1 · ubuntu · GNOME"
+        );
+        assert_eq!(compositor_identity("Mutter", None, "—"), "Mutter");
     }
 }

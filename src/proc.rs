@@ -190,6 +190,48 @@ pub fn pss_kb(pid: u32) -> u64 {
         .unwrap_or(0)
 }
 
+/// Resident memory of every process on the machine, grouped by command name and
+/// sorted largest first, in MiB.
+///
+/// `VmRSS` in `/proc/<pid>/status` is readable for other users' processes too,
+/// unlike `smaps_rollup`, so the snapshot also covers daemons the session did not
+/// start. Threads share their process's resident set, so the sum runs over
+/// processes; the sum over *names* is what turns a dozen WebKit children into one
+/// bar per application instead of a dozen.
+pub fn ram_by_name() -> Vec<(String, f64)> {
+    let mut by_name: HashMap<String, f64> = HashMap::new();
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in rd.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(kb) = read(&format!("/proc/{pid}/status")).and_then(|s| vm_rss_kb(&s)) else {
+            continue;
+        };
+        if kb == 0 {
+            continue;
+        }
+        let name = comm(pid).unwrap_or_else(|| format!("pid {pid}"));
+        *by_name.entry(name).or_insert(0.0) += kb as f64 / 1024.0;
+    }
+    let mut out: Vec<(String, f64)> = by_name.into_iter().collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+fn vm_rss_kb(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
 /// PSS of a process and all its descendants, in KiB. One pass over `/proc`
 /// builds the parent map instead of re-scanning it for every node.
 pub fn pss_tree(pid: u32) -> (u64, Vec<u32>) {
@@ -601,19 +643,70 @@ fn name_compositor() -> Option<Compositor> {
     })
 }
 
-/// `<binary> --version`, first line. Every compositor here exits immediately.
+/// `<binary> --version`, first line. Every compositor here exits immediately,
+/// but one that ignores the flag would start a nested session and never
+/// return, so the child is killed after two seconds instead of blocking the
+/// window that is about to open.
 pub fn compositor_version(name: &str) -> Option<String> {
-    let out = std::process::Command::new(name)
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(name)
         .arg("--version")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
     let line = text
         .lines()
         .next()
         .map(str::trim)
         .filter(|l| !l.is_empty())?;
     Some(line.chars().take(80).collect())
+}
+
+/// The software that implements the Wayland protocol in a session, as opposed
+/// to the process that happens to host it: Mutter is a library inside
+/// `gnome-shell`, and KWin is the compositor in a Plasma session. Names that
+/// are already the implementation (sway, niri, labwc, …) pass through.
+pub fn compositor_impl(comm: &str) -> &str {
+    match comm {
+        "gnome-shell" => "Mutter",
+        "kwin_wayland" => "KWin",
+        other => other,
+    }
+}
+
+/// The release inside a `<binary> --version` line: "sway version 1.11" and
+/// "GNOME Shell 51.1" yield "1.11" and "51.1". A line with no dotted number
+/// yields `None` rather than a stray integer from a build banner. Mutter is a
+/// library inside `gnome-shell` and shares its release, so the shell's line is
+/// mutter's version too.
+pub fn version_token(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|raw| {
+        let t = raw.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        let t = t.trim_end_matches('.');
+        let dotted = t.contains('.')
+            && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && t.split('.').all(|p| !p.is_empty());
+        dotted.then(|| t.to_string())
+    })
 }
 
 /// Short hash of the compositor's configuration, so "labwc" and "labwc with
@@ -683,6 +776,23 @@ mod tests {
     fn stat_of_this_process_parses() {
         let s = stat(std::process::id()).expect("own stat");
         assert!(s.ppid > 0, "ppid");
+    }
+
+    #[test]
+    fn the_ram_snapshot_is_sorted_and_contains_this_process() {
+        let items = ram_by_name();
+        assert!(!items.is_empty(), "no process had a resident set");
+        assert!(
+            items.windows(2).all(|w| w[0].1 >= w[1].1),
+            "grouped snapshot is not sorted: {:?}",
+            &items[..items.len().min(5)]
+        );
+        let me = comm(std::process::id()).expect("own comm");
+        let mine = items
+            .iter()
+            .find(|(name, _)| *name == me)
+            .unwrap_or_else(|| panic!("{me} missing from the snapshot"));
+        assert!(mine.1 > 0.0, "{me} has no resident set");
     }
 
     #[test]
@@ -772,6 +882,32 @@ drm-total-cycles-rcs:\t2139146184137
         assert_eq!(desktop_of("kwin_wayland"), Some("KDE Plasma"));
         assert_eq!(desktop_of("labwc"), Some("labwc"));
         assert_eq!(desktop_of("Alacritty"), None);
+    }
+
+    #[test]
+    fn compositor_implementation_is_not_the_process_name() {
+        assert_eq!(compositor_impl("gnome-shell"), "Mutter");
+        assert_eq!(compositor_impl("kwin_wayland"), "KWin");
+        assert_eq!(compositor_impl("sway"), "sway");
+        assert_eq!(compositor_impl("cosmic-comp"), "cosmic-comp");
+    }
+
+    #[test]
+    fn version_is_pulled_out_of_a_version_line() {
+        assert_eq!(version_token("GNOME Shell 51.1").as_deref(), Some("51.1"));
+        assert_eq!(version_token("sway version 1.11").as_deref(), Some("1.11"));
+        assert_eq!(
+            version_token("kwin 6.4.5 (compiled from ...)").as_deref(),
+            Some("6.4.5")
+        );
+        assert_eq!(
+            version_token("Hyprland, built from branch main at commit 1a2b3c (version: v0.51.0)")
+                .as_deref(),
+            Some("0.51.0")
+        );
+        // a build number or a word with a dot in it is not a release
+        assert_eq!(version_token("niri built 1234"), None);
+        assert_eq!(version_token("built from branch main"), None);
     }
 
     #[test]

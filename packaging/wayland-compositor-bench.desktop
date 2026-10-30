@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Wayland Compositor Bench
+GenericName=Compositor Benchmark
+Comment=Measure this Wayland session: memory, cost per frame, idle power
+Exec=wayland-compositor-bench
+Icon=wayland-compositor-bench
+Terminal=false
+Categories=System;Monitor;
+Keywords=wayland;compositor;benchmark;performance;bench;gnome;labwc;sway;
+StartupNotify=true
+StartupWMClass=dev.bench.WaylandBench

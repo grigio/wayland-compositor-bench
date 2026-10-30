@@ -126,6 +126,10 @@ pub struct PeakPhase {
     pub ram_peak_mib: f64,
     pub ram_peak_method: String,
     pub cpu_idle_pct: f64,
+    /// Mean load across the run, the number the radar plots. `None` in files
+    /// written before the radar showed an average: those runs only have the
+    /// peak, and a missing average is not a zero.
+    pub cpu_avg_pct: Option<f64>,
     pub cpu_peak_pct: f64,
 }
 
@@ -350,9 +354,10 @@ const MULTI: Phase = Phase {
 
 const PEAKS: Phase = Phase {
     key: "peaks",
-    title: "peaks during the run",
+    title: "during the run",
     columns: &[
         ("ram_peak_mib", "RAM peak", 0),
+        ("cpu_avg_pct", "CPU avg %", 1),
         ("cpu_peak_pct", "CPU peak %", 1),
     ],
     sort_by: "ram_peak_mib",
@@ -819,6 +824,25 @@ mod tests {
         assert_eq!(r.idle.unwrap().mem_mib, 700.0);
         assert!(r.render.is_none());
         assert_eq!(r.schema_version, 0);
+    }
+
+    #[test]
+    fn a_peak_block_without_an_average_reads_as_missing_not_zero() {
+        let v3 = r#"{"peaks":{"ram_peak_mib":852.0,"cpu_peak_pct":182.1}}"#;
+        let r: Run = serde_json::from_str(v3).unwrap();
+        let peaks = r.peaks.clone().unwrap();
+        assert_eq!(peaks.cpu_peak_pct, 182.1);
+        assert_eq!(peaks.cpu_avg_pct, None);
+        assert!(cell(&r, &PEAKS, "cpu_avg_pct").is_none());
+        // and a run that has it still sorts and prints
+        let r = Run {
+            peaks: Some(PeakPhase {
+                cpu_avg_pct: Some(41.5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(cell(&r, &PEAKS, "cpu_avg_pct"), Some(41.5));
     }
 
     #[test]

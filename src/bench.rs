@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
@@ -46,6 +46,7 @@ pub struct Summary {
     pub ram_mib: f64,
     pub ram_peak_mib: f64,
     pub cpu_pct: f64,
+    pub cpu_avg_pct: f64,
     pub cpu_peak_pct: f64,
     pub comp_mib: f64,
     pub comp_ms_per_frame: f64,
@@ -58,6 +59,10 @@ pub struct Summary {
     pub feat_extra: usize,
     pub feat_items: Vec<wlscan::Item>,
     pub confidence: &'static str,
+    /// session CPU during the run, one point per ~100 ms
+    pub cpu_series: Vec<CpuPoint>,
+    /// phase boundaries on the same clock
+    pub cpu_marks: Vec<CpuMark>,
 }
 
 pub struct BenchUi {
@@ -158,12 +163,87 @@ impl BenchUi {
 
 // --------------------------------------------------------------- sampling ---
 
+/// Ceiling on the timeline: a 100 ms cadence means ~20 min of run. Past that the
+/// chart stops rather than growing a vector without bound.
+const MAX_SERIES_POINTS: usize = 12000;
+
+/// (seconds since the run started, CPU % of one core)
+type CpuPoint = (f32, f32);
+/// (seconds since the run started, phase name)
+type CpuMark = (f32, &'static str);
+
+/// The session CPU timeline, kept alongside the peaks. Peaks answer "how bad did
+/// it get"; this answers "when", which is what the strip under the radar shows.
+#[derive(Default)]
+struct Series {
+    /// set by the first sample after a reset, so the run starts at t = 0
+    t0: Option<Instant>,
+    points: Vec<CpuPoint>,
+    /// phase boundaries on the same clock
+    marks: Vec<CpuMark>,
+}
+
+impl Series {
+    fn clear(&mut self) {
+        self.t0 = None;
+        self.points.clear();
+        self.marks.clear();
+    }
+
+    fn at(&mut self, now: Instant) -> f32 {
+        let t0 = *self.t0.get_or_insert(now);
+        now.duration_since(t0).as_secs_f32()
+    }
+
+    fn push(&mut self, now: Instant, pct: f64) {
+        if self.points.len() >= MAX_SERIES_POINTS {
+            return;
+        }
+        let t = self.at(now);
+        self.points.push((t, pct as f32));
+    }
+
+    fn mark(&mut self, now: Instant, name: &'static str) {
+        let t = self.at(now);
+        self.marks.push((t, name));
+    }
+}
+
+/// Average CPU load across the run, in % of one core.
+///
+/// Every sample is the load measured between the previous one and its own
+/// timestamp, so it is weighted by the span it actually describes rather than
+/// counted once: the sampler wakes every 25 ms and records every ~100 ms, which
+/// is nearly uniform but not exactly.
+fn mean_cpu(points: &[CpuPoint]) -> f64 {
+    let mut weighted = 0.0;
+    let mut total = 0.0;
+    for pair in points.windows(2) {
+        let dt = f64::from(pair[1].0 - pair[0].0);
+        if dt > 0.0 {
+            weighted += f64::from(pair[0].1) * dt;
+            total += dt;
+        }
+    }
+    if total > 0.0 {
+        weighted / total
+    } else {
+        // Fewer than two samples, or a run short enough to share one timestamp:
+        // the first reading is all we have.
+        points.first().map_or(0.0, |p| f64::from(p.1))
+    }
+}
+
 /// Polled peaks, on their own thread so GTK's main loop cannot smooth them out
 /// and so `memory.peak` (root-only to reset here) is not needed.
 struct Sampler {
     stop: Arc<AtomicBool>,
     peak_mem: Arc<AtomicU64>,
     peak_cpu: Arc<AtomicU64>,
+    /// Set by `reset`: the thread then throws away everything sampled during the
+    /// settle-in, which is not part of the run.
+    restart: Arc<AtomicBool>,
+    series: Arc<Mutex<Series>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -172,13 +252,28 @@ impl Sampler {
         let stop = Arc::new(AtomicBool::new(false));
         let peak_mem = Arc::new(AtomicU64::new(0));
         let peak_cpu = Arc::new(AtomicU64::new(0));
-        let (s, m, c) = (stop.clone(), peak_mem.clone(), peak_cpu.clone());
+        let restart = Arc::new(AtomicBool::new(false));
+        let series = Arc::new(Mutex::new(Series::default()));
+        let (s, m, c, r, se) = (
+            stop.clone(),
+            peak_mem.clone(),
+            peak_cpu.clone(),
+            restart.clone(),
+            series.clone(),
+        );
         let join = std::thread::spawn(move || {
             let dir = proc::session_cgroup();
             let stat_path = dir.join("memory.stat");
             let mut last_t = Instant::now();
             let mut last_cpu = proc::cpu_usage_usec(dir);
             while !s.load(Ordering::Relaxed) {
+                if r.swap(false, Ordering::Relaxed) {
+                    if let Ok(mut se) = se.lock() {
+                        se.clear();
+                    }
+                    last_t = Instant::now();
+                    last_cpu = proc::cpu_usage_usec(dir);
+                }
                 // Peak *working set*, not `memory.current`: the latter is mostly
                 // page cache, which moves with whatever else the session reads.
                 if let Ok(text) = std::fs::read_to_string(&stat_path) {
@@ -204,6 +299,9 @@ impl Sampler {
                     // positive floats order the same as their bit patterns, so
                     // fetch_max on the bits is a numeric max
                     c.fetch_max(pct.to_bits(), Ordering::Relaxed);
+                    if let Ok(mut se) = se.lock() {
+                        se.push(now, pct);
+                    }
                     last_t = now;
                     last_cpu = cpu;
                 }
@@ -214,13 +312,30 @@ impl Sampler {
             stop,
             peak_mem,
             peak_cpu,
+            restart,
+            series,
             join: Some(join),
         }
     }
 
+    /// Starts the measurable run: peaks back to zero, timeline back to t = 0.
     fn reset(&self) {
         self.peak_mem.store(0, Ordering::Relaxed);
         self.peak_cpu.store(0, Ordering::Relaxed);
+        self.restart.store(true, Ordering::Relaxed);
+    }
+
+    /// Names the phase that starts now, for the verticals on the timeline.
+    fn mark(&self, name: &'static str) {
+        let Ok(mut se) = self.series.lock() else {
+            return;
+        };
+        // If the sampling thread has not consumed the reset yet, do it here so
+        // the first mark does not land on the pre-run clock.
+        if self.restart.swap(false, Ordering::Relaxed) {
+            se.clear();
+        }
+        se.mark(Instant::now(), name);
     }
 
     fn peaks(&self) -> (f64, f64) {
@@ -228,6 +343,13 @@ impl Sampler {
             self.peak_mem.load(Ordering::Relaxed) as f64 / 1048576.0,
             f64::from_bits(self.peak_cpu.load(Ordering::Relaxed)),
         )
+    }
+
+    fn series(&self) -> (Vec<CpuPoint>, Vec<CpuMark>) {
+        let Ok(se) = self.series.lock() else {
+            return (Vec::new(), Vec::new());
+        };
+        (se.points.clone(), se.marks.clone())
     }
 
     fn finish(mut self) {
@@ -634,6 +756,7 @@ async fn run(ui: BenchUi) {
     // ------------------------------------------------------------- idle ---
     let settle_s = settle(&ui, opts.settle_s).await;
     sampler.reset();
+    sampler.mark("idle");
     ui.set_status(&format!(
         "measuring the idle session ({:.0} s)…",
         opts.idle_s
@@ -709,12 +832,14 @@ async fn run(ui: BenchUi) {
     }
 
     // ------------------------------------------------------- frame tests ---
+    sampler.mark("single");
     let single = frame_test(&ui, "single", opts.frames_s, &[], pid).await;
     ui.progress.set_fraction(0.55);
 
     // ----------------------------------------------------------- windows ---
     let n = opts.windows;
     ui.set_status(&format!("opening {n} toplevels…"));
+    sampler.mark("+windows");
     let base = Snapshot::take(pid);
     let wins: Vec<TestWin> = (0..n).map(|i| test_window(&ui.app, i)).collect();
     glib::timeout_future(Duration::from_millis(WINDOW_SETTLE_MS)).await;
@@ -735,6 +860,7 @@ async fn run(ui: BenchUi) {
         .iter()
         .map(|w| (w.area.clone(), w.phase.clone()))
         .collect();
+    sampler.mark("multi");
     let multi = frame_test(&ui, "multi", opts.frames_s, &extras, pid).await;
     ui.progress.set_fraction(0.85);
 
@@ -785,10 +911,14 @@ async fn run(ui: BenchUi) {
 
     // ------------------------------------------------------------- peaks ---
     let (peak_mem, peak_cpu) = sampler.peaks();
+    let (cpu_series, cpu_marks) = sampler.series();
     sampler.finish();
+    // Same vector the timeline draws, so the radar's vertex and the strip below
+    // it cannot disagree.
+    let cpu_avg = mean_cpu(&cpu_series);
     let ram_peak = peak_mem.max(i1.working_set_mib());
 
-    ui.section("peaks during the run");
+    ui.section("during the run");
     ui.add("RAM before test", &sysinfo::fmt_mib(i1.working_set_mib()));
     ui.add(
         "RAM peak during test",
@@ -803,10 +933,14 @@ async fn run(ui: BenchUi) {
         &format!("{cpu_pct:.2} % of one core"),
     );
     ui.add(
+        "CPU average during test",
+        &format!("{cpu_avg:.1} % of one core"),
+    );
+    ui.add(
         "CPU peak during test",
         &format!("{peak_cpu:.1} % of one core"),
     );
-    ui.add("peak sampling", &format!("every {PEAK_PERIOD_MS} ms"));
+    ui.add("sampling", &format!("every {PEAK_PERIOD_MS} ms"));
 
     // --------------------------------------------------------- confidence --
     if let Some(r) = &single {
@@ -842,6 +976,7 @@ async fn run(ui: BenchUi) {
         ram_mib: i1.working_set_mib(),
         ram_peak_mib: ram_peak,
         cpu_pct,
+        cpu_avg_pct: cpu_avg,
         cpu_peak_pct: peak_cpu,
         comp_mib,
         comp_ms_per_frame: single.as_ref().map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
@@ -854,6 +989,8 @@ async fn run(ui: BenchUi) {
         feat_extra: feats.extra,
         feat_items: feats.items.clone(),
         confidence,
+        cpu_series,
+        cpu_marks,
     });
 
     // --------------------------------------------------------------- json ---
@@ -930,6 +1067,7 @@ async fn run(ui: BenchUi) {
                 ram_peak_mib: ram_peak,
                 ram_peak_method: format!("polled every {PEAK_PERIOD_MS} ms"),
                 cpu_idle_pct: cpu_pct,
+                cpu_avg_pct: Some(cpu_avg),
                 cpu_peak_pct: peak_cpu,
             }),
         };
@@ -1102,5 +1240,20 @@ fn confidence(checks: &[report::Check]) -> &'static str {
         "medium"
     } else {
         "high"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_average_weights_each_sample_by_its_span() {
+        // 10 % of a core for the first half of the run, 100 % for the second
+        let pts: Vec<CpuPoint> = vec![(0.0, 10.0), (0.5, 100.0), (1.0, 100.0)];
+        assert!((mean_cpu(&pts) - 55.0).abs() < 1e-6);
+        // a sample that never got an interval of its own is not invented
+        assert_eq!(mean_cpu(&[]), 0.0);
+        assert!((mean_cpu(&[(0.0, 42.0)]) - 42.0).abs() < 1e-6);
     }
 }

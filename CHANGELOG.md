@@ -4,6 +4,43 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A CPU timeline under the radar: the same 100 ms samples that feed the
+  radar's `CPU avg` vertex, drawn as a strip across the run (idle, single-surface
+  frame test, extra toplevels, multi-surface frame test), so it is visible *when*
+  the session got busy instead of only how busy it got. The axis is 0–100 % of
+  one core and only grows in 100 % steps when a run really goes past one core.
+- A `TOP RAM CONSUMERS` row spanning both panels, just above the protocol list:
+  one horizontal bar cut into a stripe per process name — the nine heaviest in
+  their own colour, a grey `Others` for everything below the cut — with the name
+  and its resident size in each legend tag under the bar. It is a single snapshot
+  taken when the window opens, so a benchmark run never moves it, and the numbers
+  are RSS from `/proc/<pid>/status` grouped by `comm`, which turns a dozen WebKit
+  children into one stripe instead of a dozen. Clicking a stripe dims the others
+  and highlights that name's tag; clicking the same stripe again clears it. The
+  window is taller to hold it.
+
+### Changed
+
+- The radar's red vertex is `CPU AVG`, not `CPU PEAK`: the mean of the samples
+  across the run is the load the session actually carried, where one spike while
+  a window opened used to decide the whole axis. The peak is still in the
+  details and in the JSON.
+- The run JSON records `peaks.cpu_avg_pct` next to the peak, and the `peaks`
+  table in `--report` now has a `CPU avg %` column. The field is optional, so
+  files written by 0.3.1 and earlier keep loading and print `-` there rather
+  than a zero that was never measured — no schema bump, no runs thrown away.
+- The `Wayland compositor` row reads `Mutter 51.1 · GNOME` instead of just
+  `GNOME`: the implementation and its release first, then the desktop. Mutter
+  is a library inside GNOME Shell, so the process name never named it; KWin,
+  cosmic-comp and the standalone compositors are mapped the same way, and a
+  standalone compositor that is its own desktop (`sway`, `labwc`) is not named
+  twice. `--check` prints the identical string, so the terminal and the window
+  cannot disagree about what the session is.
+
 ## [0.3.1] — 2026-10-29
 
 ### Changed
