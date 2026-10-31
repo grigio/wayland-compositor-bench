@@ -38,6 +38,17 @@ pub struct ThreadShare {
     pub share_pct: f64,
 }
 
+/// One separate shell/panel/notification process included in the desktop
+/// stack. A compositor whose shell lives inside its own process reports none.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackProcess {
+    pub pid: u32,
+    pub name: String,
+    pub pss_mib: f64,
+    pub cpu_pct: f64,
+}
+
 /// One point of the session CPU timeline: seconds since the run started, CPU %
 /// of one core. Only written with `--json`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -78,12 +89,30 @@ pub struct IdlePhase {
     pub procs: usize,
     pub cpu_pct: f64,
     pub comp_cpu_pct: f64,
+    /// compositor CPU plus the separately declared shell/panel processes.
+    /// `None` in older files and when no stack was declared.
+    pub stack_cpu_pct: Option<f64>,
+    /// session CPU not attributable to the stack or to this benchmark. This is
+    /// the number `quiet cpu` checks; a shell is part of the desktop, not noise.
+    pub unrelated_cpu_pct: Option<f64>,
     /// session CPU not attributable to the compositor process tree or to this
-    /// benchmark. `None` in files written before the field existed: a missing
-    /// measurement is not zero CPU.
+    /// benchmark. Kept with its v3 meaning (it includes a separate shell).
     pub other_cpu_pct: Option<f64>,
     pub wakeups_per_s: f64,
     pub comp_pss_mib: f64,
+    /// compositor PSS plus the separately declared shell/panel processes.
+    pub stack_pss_mib: Option<f64>,
+    /// `integrated` when the compositor process already contains the shell
+    /// (GNOME), `modular` when the stack adds separate processes.
+    pub stack_style: String,
+    /// `auto`, `none`, or the user's comma-separated `--stack` selector.
+    pub stack_declared: String,
+    pub stack_processes: Vec<StackProcess>,
+    pub stack_wakeups_per_s: Option<f64>,
+    /// PSS of this benchmark process, so session memory can be corrected for it.
+    pub self_pss_mib: Option<f64>,
+    /// session working set without this benchmark client.
+    pub mem_excl_self_mib: Option<f64>,
     /// null when RAPL is unreadable or the battery is not discharging
     pub psys_w: Option<f64>,
     pub pkg_w: Option<f64>,
@@ -148,8 +177,22 @@ pub struct RenderPhase {
     pub dropped: i64,
     pub fps: f64,
     pub target_hz: f64,
+    /// the cadence the client was asked to target; `None` means native refresh
+    pub workload_hz: Option<f64>,
     /// the rate the compositor actually settled into
     pub cadence_hz: f64,
+    /// delivered frames as a share of the panel refresh: 60 fps on a 120 Hz
+    /// panel is 50 %, not 100 %. This is the cross-compositor pacing number.
+    pub pacing_vs_panel: Option<f64>,
+    /// frames missed against the panel period, not the observed cadence
+    pub dropped_vs_panel: Option<i64>,
+    /// p95 frame interval as a multiple of the panel period
+    pub p95_over_panel: Option<f64>,
+    /// compositor CPU time over the measured wall clock, % of one core
+    pub comp_cpu_pct_load: Option<f64>,
+    /// compositor CPU over the test window, scaled from the panel refresh to a
+    /// common 60 Hz panel. `None` in files written before it was recorded.
+    pub comp_cpu_pct_at_60hz: Option<f64>,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub max_ms: f64,
@@ -285,6 +328,13 @@ pub struct Run {
     pub desktop_env: String,
     pub cgroup: String,
     pub cgroup_exact: bool,
+    /// `login-session`, `user-manager`, `login-session+user-manager` or
+    /// `user-slice`; empty in older files
+    pub cgroup_kind: String,
+    /// `integrated` or `modular`; empty in older files
+    pub stack_style: String,
+    /// `native` or `reference`; empty in older files
+    pub profile: String,
     /// "on" or "off": whether the window used the compositor's blur
     pub blur: String,
     /// high / medium / low, derived from `checks`
@@ -382,18 +432,39 @@ pub struct Stats {
     pub median: f64,
     pub min: f64,
     pub max: f64,
+    /// median absolute deviation: a spread estimate that one outlier cannot
+    /// inflate the way the range can
+    pub mad: f64,
 }
 
 impl Stats {
-    /// Half the observed range, floored at 2 % of the median. Used as the noise
-    /// floor when deciding whether two labels actually differ.
+    /// Half the observed range, floored at the median absolute deviation and
+    /// at 2 % of the median. Used as the noise floor when deciding whether two
+    /// labels actually differ.
     pub fn noise(&self) -> f64 {
         let spread = if self.n > 1 {
             (self.max - self.min) / 2.0
         } else {
             0.0
         };
-        spread.max(self.median.abs() * 0.02)
+        spread
+            .max(1.57 * self.mad / (self.n as f64).sqrt())
+            .max(self.median.abs() * 0.02)
+    }
+
+    /// True when there are enough runs for a median and a spread to mean
+    /// anything. One run is an anecdote, not a comparison.
+    pub fn enough_runs(&self) -> bool {
+        self.n >= 3
+    }
+}
+
+fn median_of_sorted(v: &[f64]) -> f64 {
+    let n = v.len();
+    if n.is_multiple_of(2) {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    } else {
+        v[n / 2]
     }
 }
 
@@ -404,16 +475,15 @@ pub fn stats(mut v: Vec<f64>) -> Option<Stats> {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    let median = if n.is_multiple_of(2) {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    } else {
-        v[n / 2]
-    };
+    let median = median_of_sorted(&v);
+    let mut deviations: Vec<f64> = v.iter().map(|x| (x - median).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Some(Stats {
         n,
         median,
         min: v[0],
         max: v[n - 1],
+        mad: median_of_sorted(&deviations),
     })
 }
 
@@ -449,10 +519,12 @@ const IDLE: Phase = Phase {
         ("peak_mib", "peak MiB", 0),
         ("anon_mib", "anon MiB", 0),
         ("comp_pss_mib", "comp MiB", 0),
+        ("stack_pss_mib", "stack MiB", 0),
         ("procs", "procs", 0),
         ("cpu_pct", "CPU %", 2),
         ("comp_cpu_pct", "comp CPU %", 2),
-        ("other_cpu_pct", "other CPU %", 2),
+        ("stack_cpu_pct", "stack CPU %", 2),
+        ("unrelated_cpu_pct", "unrel CPU %", 2),
         ("wakeups_per_s", "wakeups/s", 0),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
@@ -482,13 +554,16 @@ const RENDER: Phase = Phase {
     columns: &[
         ("fps", "fps", 1),
         ("cadence_hz", "cadence Hz", 1),
+        ("pacing_vs_panel", "panel %", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
+        ("comp_cpu_pct_at_60hz", "CPU@60Hz %", 2),
         ("gpu_ms_per_frame", "comp gpu", 3),
         ("app_gpu_ms_per_frame", "client gpu", 3),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
         ("dropped", "dropped", 0),
+        ("dropped_vs_panel", "drop/panel", 0),
         ("frames", "frames", 0),
     ],
     sort_by: "comp_ms_per_frame",
@@ -500,13 +575,16 @@ const MULTI: Phase = Phase {
     columns: &[
         ("fps", "fps", 1),
         ("cadence_hz", "cadence Hz", 1),
+        ("pacing_vs_panel", "panel %", 1),
         ("comp_ms_per_frame", "comp ms/frame", 3),
+        ("comp_cpu_pct_at_60hz", "CPU@60Hz %", 2),
         ("gpu_ms_per_frame", "comp gpu", 3),
         ("app_gpu_ms_per_frame", "client gpu", 3),
         ("psys_w", "psys W", 2),
         ("batt_w", "bat W", 2),
         ("p95_ms", "p95 ms", 2),
         ("dropped", "dropped", 0),
+        ("dropped_vs_panel", "drop/panel", 0),
         ("frames", "frames", 0),
     ],
     sort_by: "comp_ms_per_frame",
@@ -545,9 +623,14 @@ fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
                 "peak_mib" => p.peak_mib,
                 "anon_mib" => p.anon_mib,
                 "comp_pss_mib" => p.comp_pss_mib,
+                "stack_pss_mib" => p.stack_pss_mib?,
                 "procs" => p.procs as f64,
                 "cpu_pct" => p.cpu_pct,
                 "comp_cpu_pct" => p.comp_cpu_pct,
+                "stack_cpu_pct" => p.stack_cpu_pct?,
+                // Old files have no stack split: their `other_cpu_pct` is the
+                // closest available "outside the compositor and this tool".
+                "unrelated_cpu_pct" => p.unrelated_cpu_pct.or(p.other_cpu_pct)?,
                 "other_cpu_pct" => p.other_cpu_pct?,
                 "wakeups_per_s" => p.wakeups_per_s,
                 "psys_w" => p.psys_w?,
@@ -586,12 +669,18 @@ fn cell(run: &Run, phase: &Phase, field: &str) -> Option<f64> {
             Some(match field {
                 "fps" => p.fps,
                 "cadence_hz" => p.cadence_hz,
+                "pacing_vs_panel" => p.pacing_vs_panel? * 100.0,
+                "pacing_vs_panel_share" => p.pacing_vs_panel?,
                 "comp_ms_per_frame" => p.comp_ms_per_frame,
+                "comp_cpu_pct_load" => p.comp_cpu_pct_load?,
+                "comp_cpu_pct_at_60hz" => p.comp_cpu_pct_at_60hz?,
                 "gpu_ms_per_frame" => p.gpu_ms_per_frame?,
                 "comp_gpu_ms_per_frame" => p.comp_gpu_ms_per_frame?,
                 "app_gpu_ms_per_frame" => p.app_gpu_ms_per_frame?,
                 "p95_ms" => p.p95_ms,
+                "p95_over_panel" => p.p95_over_panel?,
                 "dropped" => p.dropped as f64,
+                "dropped_vs_panel" => p.dropped_vs_panel? as f64,
                 "frames" => p.frames as f64,
                 "psys_w" => p.psys_w?,
                 "batt_w" => p.batt_w?,
@@ -730,6 +819,24 @@ fn load(targets: &[PathBuf]) -> Result<(Labeled, usize), String> {
     Ok((runs, skipped))
 }
 
+/// Scope kind for old files too. A v3 file written before the field existed
+/// still carries the cgroup path, which is enough to tell a login scope from
+/// the user manager.
+fn cgroup_kind_of(run: &Run) -> &str {
+    if !run.cgroup_kind.is_empty() {
+        return &run.cgroup_kind;
+    }
+    if run.cgroup.contains("user@") {
+        "user-manager"
+    } else if run.cgroup.contains("session-") {
+        "login-session"
+    } else if run.cgroup.contains("user.slice") {
+        "user-slice"
+    } else {
+        ""
+    }
+}
+
 /// `--report`: medians per label, one table per phase.
 pub fn print(targets: &[PathBuf]) -> Result<(), String> {
     let (runs, skipped) = load(targets)?;
@@ -854,6 +961,80 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
                 break;
             }
         }
+        // Only known values can disagree; an old file that predates the field
+        // is not a third kind, it is an unknown.
+        let kinds: Vec<&str> = list
+            .iter()
+            .map(cgroup_kind_of)
+            .filter(|k| !k.is_empty())
+            .collect();
+        if kinds.len() > 1 && kinds.iter().any(|k| *k != kinds[0]) {
+            warnings.push(format!(
+                "{label}: runs used different cgroup kinds ({}), so session totals are not the \
+                 same scope",
+                kinds.join(", ")
+            ));
+        }
+        let styles: Vec<&str> = list
+            .iter()
+            .map(|r| r.stack_style.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if styles.len() > 1 && styles.iter().any(|s| *s != styles[0]) {
+            warnings.push(format!(
+                "{label}: runs mixed stack styles ({}); core and stack numbers are not \
+                 interchangeable",
+                styles.join(", ")
+            ));
+        }
+        let profiles: Vec<&str> = list
+            .iter()
+            .map(|r| r.profile.as_str())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if profiles.len() > 1 && profiles.iter().any(|p| *p != profiles[0]) {
+            warnings.push(format!(
+                "{label}: runs used different workload profiles ({}), so render numbers are not \
+                 comparable",
+                profiles.join(", ")
+            ));
+        }
+        let workload = |r: &Run| {
+            r.multi
+                .as_ref()
+                .or(r.render.as_ref())
+                .and_then(|p| p.workload_hz)
+        };
+        let mut workloads: Vec<String> = list
+            .iter()
+            .map(|r| {
+                workload(r)
+                    .map(|h| format!("{h:.0} Hz"))
+                    .unwrap_or_else(|| "native".into())
+            })
+            .collect();
+        workloads.sort();
+        workloads.dedup();
+        if workloads.len() > 1 {
+            warnings.push(format!(
+                "{label}: runs targeted different render workloads ({}), so CPU@60Hz mixes \
+                 different amounts of work",
+                workloads.join(", ")
+            ));
+        }
+        let selectors: Vec<&str> = list
+            .iter()
+            .filter_map(|r| r.idle.as_ref())
+            .map(|p| p.stack_declared.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if selectors.len() > 1 && selectors.iter().any(|s| *s != selectors[0]) {
+            warnings.push(format!(
+                "{label}: runs used different stack selectors ({}), so the idle scopes are \
+                 not the same",
+                selectors.join(", ")
+            ));
+        }
         let blur = |r: &Run| {
             if r.blur.is_empty() {
                 "unrecorded".to_string()
@@ -916,9 +1097,15 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
 
     println!(
         "\ncomp ms/frame = compositor CPU time per presented frame (lower = leaner).\n\
+         stack MiB/CPU = compositor plus the declared shell/panel processes; unrel CPU = the\n\
+         rest of the session, excluding the stack and this benchmark.\n\
          comp gpu = compositor GPU time per frame; client gpu = this benchmark's, both from DRM fdinfo (estimate, null without counters).\n\
          RAM = anon+shmem working set: page cache follows what the session read, not what it costs.\n\
-         dropped = missed frames against the observed cadence, not the panel's refresh rate.\n\
+         panel % = delivered frames as a share of the panel refresh; drop/panel = frames missed\n\
+         against that panel period. CPU@60Hz % = compositor CPU over the test, scaled from the\n\
+         panel refresh to 60 Hz.\n\
+         dropped = missed frames against the observed cadence, which is useful for native-rate\n\
+         runs but flatters a deliberately throttled one.\n\
          extra toplevels: ws/window is the signed working-set delta per window, omitted when the\n\
          delta is negative or the baseline drifted; residual is what was not returned to the\n\
          pre-open baseline; post-close is the drift between two post-close samples; client\n\
@@ -929,8 +1116,9 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
 }
 
 /// `--compare A B`: medians side by side, with a noise floor so a difference
-/// smaller than the run-to-run spread is not reported as a win.
-pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
+/// smaller than the run-to-run spread is not reported as a win. With `strict`,
+/// an incomparable pair is an error instead of a warning.
+pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<(), String> {
     let (runs, _) = load(targets)?;
     let grab = |needle: &str| -> Vec<Run> {
         let mut out = Vec::new();
@@ -972,8 +1160,108 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
     println!("\ncomparing '{a}' vs '{b}'\n");
     ctx(a, &ra);
     ctx(b, &rb);
-    if let Some(d) = ra[0].env.display_delta(&rb[0].env) {
+    let display_differ = ra[0].env.display_delta(&rb[0].env);
+    if let Some(d) = &display_differ {
         println!("\n! displays differ ({d}) — RAM and power are not comparable");
+    }
+
+    let mut warnings = Vec::new();
+    let ka = cgroup_kind_of(&ra[0]);
+    let kb = cgroup_kind_of(&rb[0]);
+    if !ka.is_empty() && !kb.is_empty() && ka != kb {
+        warnings.push(format!(
+            "cgroup kinds differ ({ka} vs {kb}): the two runs do not cover the same session \
+             processes"
+        ));
+    }
+    let (sa, sb) = (ra[0].stack_style.as_str(), rb[0].stack_style.as_str());
+    if !sa.is_empty() && !sb.is_empty() && sa != sb {
+        warnings.push(format!(
+            "stack styles differ ({sa} vs {sb}): compare core with core or stack with stack"
+        ));
+    }
+    // The style alone is not the scope: `--stack none` and `--stack auto` are
+    // both "modular" on labwc but count different processes.
+    let selector = |r: &Run| {
+        r.idle
+            .as_ref()
+            .map(|p| p.stack_declared.clone())
+            .unwrap_or_default()
+    };
+    let (xa, xb) = (selector(&ra[0]), selector(&rb[0]));
+    if !xa.is_empty() && !xb.is_empty() && xa != xb {
+        warnings.push(format!(
+            "stack selectors differ ({xa} vs {xb}): the two runs count different shell/panel \
+             processes"
+        ));
+    }
+    let (pa, pb) = (ra[0].profile.as_str(), rb[0].profile.as_str());
+    if !pa.is_empty() && !pb.is_empty() && pa != pb {
+        warnings.push(format!(
+            "workload profiles differ ({pa} vs {pb}): use the same --profile on both sides"
+        ));
+    }
+    if ra[0].blur != rb[0].blur {
+        warnings.push(format!(
+            "blur differs ({} vs {}): the compositor is doing different work",
+            ra[0].blur, rb[0].blur
+        ));
+    }
+    // `--target-hz` can differ while the profile string stays `native`, and a
+    // damage-driven compositor uses less CPU when the client asks for fewer
+    // frames. CPU@60Hz would then measure two workloads, not two compositors.
+    let workload = |r: &Run| {
+        r.multi
+            .as_ref()
+            .or(r.render.as_ref())
+            .and_then(|p| p.workload_hz)
+    };
+    match (workload(&ra[0]), workload(&rb[0])) {
+        (Some(a), Some(b)) if (a - b).abs() >= 0.5 => warnings.push(format!(
+            "render workloads differ ({a:.0} vs {b:.0} Hz target): CPU@60Hz measures different \
+             amounts of work"
+        )),
+        (Some(a), None) | (None, Some(a)) => warnings.push(format!(
+            "render workloads differ (native refresh vs {a:.0} Hz target): CPU@60Hz measures \
+             different amounts of work"
+        )),
+        _ => {}
+    }
+    let power = |r: &Run| {
+        (
+            r.env.profile.clone(),
+            r.env.governor.clone(),
+            r.env.epp.clone(),
+        )
+    };
+    if power(&ra[0]) != power(&rb[0]) {
+        warnings.push(format!(
+            "power settings differ ({:?}/{:?}/{:?} vs {:?}/{:?}/{:?})",
+            power(&ra[0]).0,
+            power(&ra[0]).1,
+            power(&ra[0]).2,
+            power(&rb[0]).0,
+            power(&rb[0]).1,
+            power(&rb[0]).2
+        ));
+    }
+    let pacing_source = |r: &Run| {
+        r.render
+            .as_ref()
+            .map(|p| p.pacing_source.clone())
+            .unwrap_or_default()
+    };
+    let (psa, psb) = (pacing_source(&ra[0]), pacing_source(&rb[0]));
+    if !psa.is_empty() && !psb.is_empty() && psa != psb {
+        warnings.push(format!(
+            "pacing source differs ({psa} vs {psb}): one side lacks presentation feedback"
+        ));
+    }
+    if !warnings.is_empty() {
+        println!("\n! comparability:");
+        for w in &warnings {
+            println!("  - {w}");
+        }
     }
 
     let mut phases = vec![IDLE, WINDOWS];
@@ -988,6 +1276,7 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
         phases.push(PEAKS);
     }
 
+    let mut anecdotal = false;
     for phase in &phases {
         let (la, lb): (Vec<&Run>, Vec<&Run>) = (
             ra.iter().filter(|r| has_phase(r, phase.key)).collect(),
@@ -1024,7 +1313,13 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
             };
             let delta = sb.median - sa.median;
             let noise = sa.noise().max(sb.noise());
-            let verdict = if delta.abs() <= noise {
+            let enough = sa.enough_runs() && sb.enough_runs();
+            let verdict = if !enough {
+                // A single run cannot establish a spread, let alone a win.
+                // Keep the numbers visible, but say what they are.
+                anecdotal = true;
+                format!("anecdotal (n {} vs {})", sa.n, sb.n)
+            } else if delta.abs() <= noise {
                 format!("same (noise ±{noise:.nd$})")
             } else if sa.median == 0.0 {
                 // A percentage against zero is not a percentage; report the
@@ -1043,7 +1338,18 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf]) -> Result<(), String> {
             );
         }
     }
-    println!("\n'verdict' compares the medians against the observed spread; a change\nsmaller than that spread is not a result.");
+    println!(
+        "\n'verdict' compares the medians against the observed spread; a change\n\
+         smaller than that spread is not a result. With fewer than 3 runs per\n\
+         label it says 'anecdotal' instead of inventing a winner."
+    );
+    if strict && (anecdotal || display_differ.is_some() || !warnings.is_empty()) {
+        return Err(
+            "--strict: the two sides are not comparable (fewer than three runs per label, or \
+             the warnings above)"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 

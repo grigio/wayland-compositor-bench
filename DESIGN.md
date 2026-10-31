@@ -39,7 +39,7 @@ to measure the cost of a real client (its own window) inside a real session.
 
 ## Run pipeline
 
-1. Resolve the session cgroup, the compositor process and the desktop identity.
+1. Resolve the session cgroups, the compositor process and the desktop identity.
 2. Collect the environment snapshot (CPU, GPU, memory, display, power profile,
    kernel, Mesa, compositor config hash).
 3. Scan the Wayland registry on a dedicated connection and probe blur support.
@@ -62,28 +62,41 @@ phase begins, and runs until the summary is built. Its phase marks are `idle`,
 
 ### Cgroup
 
-The measurement scope is the cgroup that holds the desktop, resolved from
-`/proc/self/cgroup`:
+The measurement scope is resolved from `/proc/self/cgroup`:
 
-1. `.../session-N.scope` — a logind login session, where TTY-started
-   compositors and their apps live.
+1. `.../session-N.scope` — a logind login session, where the compositor started
+   by the display manager and the apps it spawned live.
 2. `.../user@<uid>.service` — the systemd user manager. GNOME and Plasma 6 run
    the compositor and the session services as user services, and launch apps as
    `app-*.scope` units under the manager, outside `session-N.scope`. The
    manager is the directory that actually contains the session, so it counts as
    exact; in the same setup `session-N.scope` holds only the greeter worker.
-3. `/sys/fs/cgroup/user.slice/user-<uid>.slice` — the last resort (containers,
+3. Both at once — `login-session+user-manager`. A desktop can span the two
+   halves: greetd starts labwc in `session-N.scope`, while a panel, notification
+   daemon or portal started from a systemd user unit (Noctalia, SwayNC, the
+   portals) lives under `user@<uid>.service`. The two subtrees are siblings, so
+   their `memory.stat`, `cpu.stat` and process lists are disjoint and can be
+   summed. Measuring one half alone would compare half a desktop.
+4. `/sys/fs/cgroup/user.slice/user-<uid>.slice` — the last resort (containers,
    no user manager). It also contains other sessions and unrelated processes,
    so it is reported as `cgroup_exact: false` and `--report` warns about it.
 
 A run on a user slice is usable, but session RAM and CPU include neighbours.
-`--check` prints the resolved path and which of the three it is.
+`--check` prints the resolved paths and which of the four kinds it is. The JSON
+`cgroup` field joins the paths with ` + `, and `cgroup_kind` records the kind.
 
-The directory is a tree, not a list: systemd attaches every session process to a
+The directories are trees, not lists: systemd attaches every session process to a
 child cgroup (`session.slice`, `app.slice`, …), so the manager's own
 `cgroup.procs` is empty. Process-level figures — the process count, the idle CPU
-attribution and the contaminant scan — walk the whole subtree, while RAM and CPU
-totals come from the hierarchical `memory.stat` and `cpu.stat`.
+attribution and the contaminant scan — walk every subtree, while RAM and CPU
+totals come from the hierarchical `memory.stat` and `cpu.stat` of each measured
+cgroup, added together.
+
+PSI is the exception: `cpu.pressure` and `memory.pressure` are shares of wall
+time, and two sibling cgroups can stall at the same instant, so adding them
+would double-count. The live panel and `--check` report the highest `avg10` of
+the measured cgroups, which is a floor for the desktop rather than a claim that
+one half is the whole.
 
 ### Compositor
 
@@ -129,7 +142,8 @@ reported, but never used to name the run.
 
 ### Memory
 
-- **Working set** = `anon + shmem` from the session cgroup's `memory.stat`.
+- **Working set** = `anon + shmem` from the `memory.stat` of each measured
+  cgroup, added together.
   Page cache (`file`) is excluded because it follows what the session read, not
   what the desktop costs.
 - **`memory.current`** is reported separately as the whole cgroup, cache
@@ -137,9 +151,19 @@ reported, but never used to name the run.
 - **Peak RAM** is sampled every 25 ms from `memory.stat`, not taken from
   `memory.peak`: the kernel high-water mark can only be reset by root, so it
   would report "since login". The sampler takes the maximum of `anon + shmem`.
-- **Compositor memory** is the PSS of the compositor process and all its
+- **Compositor memory (core)** is the PSS of the compositor process and all its
   descendants, read from `smaps_rollup`. PSS avoids counting shared pages once
   per process.
+- **Stack memory** adds the separate shell/panel/notification processes found by
+  `stack::detect` (or named with `--stack`). A compositor whose shell lives in
+  its own process reports `stack_style: "integrated"`; a compositor with a
+  separate panel reports `"modular"` and lists the added processes. The
+  selector, the added processes and their individual PSS/CPU are stored, so the
+  scope is auditable rather than implied.
+- **Benchmark correction:** `self_pss_mib` and `mem_excl_self_mib` record the
+  benchmark client's own PSS and the session working set without it. The
+  headline session figure still includes the client, because the client is a
+  real client; the correction is there for readers who want the desktop alone.
 - **Extra toplevels:** wait for the single-surface test's transient buffers to
   drain, take two baselines a second apart, then open the windows and wait for
   them to settle. The second baseline is the reference; the drift between the
@@ -166,17 +190,22 @@ reported, but never used to name the run.
   the latter is quantised to 10 ms ticks; a lean compositor at 120 Hz burns only
   a few milliseconds per second, which is below tick resolution.
 - **Other CPU** is session CPU minus the compositor process tree and the
-  benchmark process, floored at zero. The headline and the top-offender list
-  are computed from the same idle snapshot pair and the same exclusion set, so
-  the named processes add up to the number shown. A process that did not exist
-  at the start of the window is not charged its whole lifetime CPU. It is not a
-  guess about what "should" be running.
+  benchmark process, floored at zero. It keeps its v3 meaning: a separate shell
+  counts as other.
+- **Stack CPU** is compositor CPU plus the CPU of the declared shell/panel
+  processes, measured with the same before/after `schedstat` snapshots.
+- **Unrelated CPU** is session CPU minus the stack and the benchmark. This is
+  the number the `quiet cpu` check uses, and the top-offender list excludes the
+  declared stack so a panel is not reported as an intruder. A process that did
+  not exist at the start of the window is not charged its whole lifetime CPU.
+  It is not a guess about what "should" be running.
 - **Idle CPU** is a before/after snapshot over `--idle` seconds. The start
   snapshot scans first and reads the counters last; the end snapshot reads the
   counters first and scans last, so neither `/proc` walk is inside the interval.
   The denominator is the measured `Instant` difference, stored as `measured_s`,
-  not the requested `dur_s`. A `quiet cpu` check fails when other CPU exceeds
-  5 % of one core and names the busiest processes from that same idle window.
+  not the requested `dur_s`. A `quiet cpu` check fails when unrelated CPU
+  exceeds 5 % of one core and names the busiest processes from that same idle
+  window.
 - **Wakeups/s** sums voluntary and non-voluntary context switches over every
   `/proc/<pid>/task/*/status`, not just the thread-group leader, and divides by
   the measured idle window.
@@ -209,9 +238,26 @@ adds animated toplevels that repaint every frame. Frames are collected from GDK'
   dropped.
 - **Dropped frames** are counted against the observed cadence:
   `sum(max(round(delta / cadence) - 1, 0))`.
+- **Panel pacing** is the cross-compositor number: delivered frames as a share
+  of the advertised panel refresh (`fps / advertised`, clamped to 0..1).
+  `dropped_vs_panel` counts misses against the panel period and
+  `p95_over_panel` expresses the p95 interval in panel periods. A deliberate
+  60 fps on a 120 Hz panel is 50 %, which is what it is; `dropped` against the
+  observed cadence would call it perfect.
+- **Workload target:** `--target-hz HZ` (or `--profile reference`, which
+  defaults to 60) makes the client skip frame-clock ticks that arrive sooner
+  than the target period. Only drawn frames are collected, so the skipped
+  history is not counted as delivered work. `workload_hz` records the target;
+  `null` means native refresh.
 - **`comp ms/frame`** is compositor CPU time in the test window divided by
   presented frames. It is independent of GPU speed and is the main "render path
-  weight" figure.
+  weight" figure. `comp_cpu_pct_load` is the same CPU as a share of one core
+  over the measured wall clock. `comp_cpu_pct_at_60hz` scales that measured CPU
+  by `60 / panel_hz`, so a 120 Hz run is not flattered. Scaling total CPU, not
+  CPU per presented frame, matters when the client is throttled: a compositor
+  can keep doing per-vblank work while the client presents half as often, and
+  `comp_ms/frame × 60` would then report twice the cost it would have on a
+  60 Hz panel.
 - **`app ms/frame`** is the benchmark's own CPU per frame. If it approaches
   `comp ms/frame`, the run measured a slow client as much as a slow compositor.
 - **Session CPU** for the window, the benchmark's own share, and the session
@@ -302,14 +348,14 @@ detail.
 
 | check | what it proves |
 |---|---|
-| `session cgroup` | the measurement scope is this login session, not the user slice |
+| `session cgroup` | the measurement scope covers this desktop, not the user slice |
 | `compositor process` | a compositor process was found |
 | `desktop identity` | `XDG_CURRENT_DESKTOP` agrees with the socket owner |
 | `display refresh` | refresh is known from EDID or the compositor |
 | `RAPL power` | at least one RAPL domain is readable |
 | `battery discharging` | battery power is meaningful |
-| `clean session` | no unrelated process holds 150 MiB or more |
-| `quiet cpu` | other CPU stayed at or below 5 % of one core |
+| `clean session` | no process outside the declared stack holds 150 MiB or more |
+| `quiet cpu` | unrelated CPU stayed at or below 5 % of one core |
 | `presentation feedback` | frame timings came from `presentation_time` |
 | `GPU counters` | DRM fdinfo exposed usable counters |
 
@@ -349,17 +395,28 @@ Top-level fields:
 | group | fields |
 |---|---|
 | identity | `schema_version`, `label`, `compositor`, `compositor_version`, `compositor_pid`, `compositor_source` |
-| context | `when`, `desktop`, `desktop_env`, `cgroup`, `cgroup_exact`, `env` |
+| context | `when`, `desktop`, `desktop_env`, `cgroup`, `cgroup_exact`, `cgroup_kind`, `stack_style`, `profile`, `env` |
 | validity | `blur`, `confidence`, `checks`, `clean`, `contaminants` |
 | coverage | `features` (`null` when the registry scan failed) |
 | phases | `idle`, `windows`, `render`, `multi`, `peaks` |
+
+`cgroup_kind` is `login-session`, `user-manager`,
+`login-session+user-manager` or `user-slice`;
+`stack_style` is `integrated` or `modular`; `profile` is `native` or
+`reference`. An old v3 file has empty strings here, and `--report` reconstructs
+the cgroup kind from the stored cgroup path.
 
 Numeric fields added after v3 are `Option`/`#[serde(default)]`, so an old file
 that never measured them loads as `null` and prints `-`, not `0`. This applies
 to `idle.other_cpu_pct`, `render.self_cpu_s`,
 `render.session_cpu_excl_self_s`, `windows.per_window_mib`, `idle.measured_s`,
 `render.measured_s`, and the `comp_gpu_ms_per_frame` /
-`app_gpu_ms_per_frame` split. `windows` also stores optional
+`app_gpu_ms_per_frame` split. `idle` also stores `stack_cpu_pct`,
+`unrelated_cpu_pct`, `stack_pss_mib`, `stack_wakeups_per_s`, `self_pss_mib`,
+`mem_excl_self_mib`, plus `stack_declared` and a `stack_processes` list of
+`{pid, name, pss_mib, cpu_pct}`. `render`/`multi` store `workload_hz`,
+`pacing_vs_panel`, `dropped_vs_panel`, `p95_over_panel`, `comp_cpu_pct_load`
+and `comp_cpu_pct_at_60hz`. `windows` also stores optional
 `baseline_drift_mib` and `post_close_drift_mib`, `delta_valid`, and the signed
 `delta_mib`; `residual_mib` keeps its v3 meaning. `features` stores `stale` and
 per-item `{name, label, tier, version, since, stale}`.
@@ -386,17 +443,24 @@ a path substring. Only schema v3 files are read.
 - **Medians, not means.** Each cell is the median of the runs with that label.
   When runs disagree by more than 1 %, the cell shows `[min-max]`; a single run
   shows just the value.
-- **Noise floor.** `Stats::noise()` is half the observed range, floored at 2 % of
-  the median. `--compare` reports "same (noise ±…)" when the difference is within
-  that floor, otherwise the percentage change. This prevents a 3-run median from
-  being quoted as a precise win.
+- **Noise floor.** `Stats::noise()` is half the observed range, floored at the
+  scaled median absolute deviation (`1.57 × MAD / √n`) and at 2 % of the
+  median. `--compare` reports "same (noise ±…)" when the difference is within
+  that floor, otherwise the percentage change. MAD keeps one outlier from
+  inflating the spread the way the range can.
+- **Enough runs.** Fewer than three runs per label cannot establish a spread, so
+  every row is labelled `anecdotal (n a vs b)` instead of declaring a winner.
+  `--strict` turns an anecdotal or otherwise incomparable comparison into a
+  non-zero exit.
 - **Missing is not zero.** A file without a newer optional field prints `-`;
   `--compare` prints `not measured` for that row and an absolute delta with
   `n/a` when the baseline median is zero, rather than a fabricated `+0 %`.
 - **Context warnings.** `--report` warns when a label mixes displays, config
-  hashes, blur states, user-slice scopes, contaminated sessions, compositor
-  fallback resolution or a stale desktop environment. It also prints the failing
-  checks behind a `medium` or `low` confidence.
+  hashes, blur states, cgroup kinds, stack styles, workload profiles,
+  user-slice scopes, contaminated sessions, compositor fallback resolution or a
+  stale desktop environment. `--compare` additionally warns on different power
+  settings and presentation-feedback sources. It also prints the failing checks
+  behind a `medium` or `low` confidence.
 - **Skipped files** (unreadable, wrong schema) are counted and reported.
 
 There is deliberately no single score. Any scalar over arbitrary weights
@@ -411,14 +475,25 @@ follows the measurement:
 - **Live system panel:** session identity and hardware, with CPU and RAM
   refreshed every second from cheap cgroup files; PSS, GPU memory, pressure and
   package temperature refresh every fifth tick.
-- **Six-axis radar:** pacing (frames delivered at the observed cadence, one
-  surface and the multi-surface load case), render cost (compositor CPU per
-  frame against the cadence period), compositor PSS relative to total RAM,
-  compositor idle CPU relative to one core, and protocol coverage. The memory
-  and CPU axes are logarithmic because the interesting ranges are small: 50 MiB
-  and 1.2 GiB stay visibly apart, and so do 0.3 % and 3 % idle CPU. Every axis
-  is drawn further-out-is-better, including the cost axes; hovering a label
-  highlights that axis and explains what it plots and which direction is good.
+- **Six-axis radar:** pacing against the panel refresh (one surface and the
+  multi-surface load case), render cost (compositor CPU scaled to a common
+  60 Hz panel), **stack** PSS and idle CPU, and protocol coverage.
+  The memory axis is scaled against a fixed 8 GiB reference, not the machine's
+  RAM, so the same stack lands in the same place on every machine; the CPU axes
+  are shares of one core. All three cost axes are logarithmic because the
+  interesting ranges are small: 50 MiB and 1.2 GiB stay visibly apart, so do
+  0.3 % and 3 % idle CPU, and render cost spreads the 1–10 % band a compositor
+  actually lives in over a third of the radius instead of two pixels. Every
+  axis is drawn further-out-is-better, including the cost axes,
+  which plot `1 - cost` and therefore print a number whose good direction is
+  *down*. Each vertex carries the direction its own number should move (`↓` for
+  render cost, stack RAM and stack CPU, `↑` for pacing and features), so the
+  chart never labels a cost "higher is better" and asks the reader to hold two
+  conventions at once. The marker is drawn as a path rather than a glyph,
+  because the Cairo toy font stack has no guaranteed arrow coverage and a
+  missing glyph would become a box on exactly the axes that need explaining.
+  Hovering a label highlights that axis and explains what it plots and which
+  direction is good.
 - **CPU timeline:** the 100 ms session CPU samples, drawn left to right with
   phase boundaries, so a spike while windows opened is visible instead of folded
   into one number.

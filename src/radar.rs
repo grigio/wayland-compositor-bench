@@ -1,24 +1,28 @@
 //! Six-axis radar chart for the post-run summary.
 //!
 //! Every axis is "further out is better" and every radius is measured against
-//! what the run and this machine establish, not against a hard-coded ceiling:
+//! a common reference, not against the machine or the session's own cadence:
 //!
-//! - pacing: the share of frames the compositor delivered at the cadence it
-//!   settled into, for one surface and for the surface plus N toplevels. A
-//!   clean 60 fps on a 120 Hz panel is 100 %, not 50 %;
-//! - render cost: compositor CPU per presented frame against the frame period
-//!   of the observed cadence (`1 - ms / (1000 / cadence_hz)`), so the vertex
-//!   reads as the share of a frame the compositor spends rendering. It is
-//!   independent of GPU speed;
-//! - memory: the compositor's PSS against the machine's total RAM
-//!   (`1 - ln(1 + MiB) / ln(1 + total)`), which keeps 50 MiB and 1.2 GiB
-//!   visibly apart instead of both hugging the outer ring;
-//! - CPU: compositor CPU at rest as a share of one core, also logarithmically:
+//! - pacing: delivered frames as a share of the panel refresh, for one surface
+//!   and for the surface plus N toplevels. A clean 60 fps on a 120 Hz panel is
+//!   50 %, which is the same number a 60 Hz panel would give;
+//! - render cost: compositor CPU over the frame test, scaled from the panel
+//!   refresh to a common 60 Hz panel (`1 - ln(1 + CPU@60Hz %) / ln(101)`), so a
+//!   120 Hz panel does not make the same work look cheaper, and 2 % and 8 % of
+//!   a core stay visibly apart instead of both hugging the outer ring;
+//! - memory: the stack's PSS against a fixed 8 GiB reference
+//!   (`1 - ln(1 + MiB) / ln(1 + 8192)`), which keeps 50 MiB and 1.2 GiB
+//!   visibly apart without rewarding a larger machine;
+//! - CPU: stack CPU at rest as a share of one core, also logarithmically:
 //!   the interesting idle range is 0.3–3 % and a linear axis would squash it
 //!   into a pixel;
 //! - features: protocol coverage over the scored tiers.
 //!
-//! The absolute number is printed at each vertex — that is what you quote.
+//! The stack is the compositor plus any declared shell/panel processes; the
+//! absolute number is printed at each vertex — that is what you quote. Because
+//! three axes print a cost and plot its inverse, each vertex carries the
+//! direction its own number should move (`↓` lower is better, `↑` higher is
+//! better), so the chart never asks the reader to hold two conventions at once.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -26,22 +30,21 @@ use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 
-/// Used when the machine cannot be probed, so the chart still draws something
-/// sane instead of dividing by a zero-sized ceiling.
-const FALLBACK_RAM_MIB: f64 = 2048.0;
+/// Fixed memory reference for the chart. It is deliberately not the machine's
+/// RAM: the same stack should land in the same place on every machine.
+const RAM_REFERENCE_MIB: f64 = 8192.0;
 
-/// The ceiling this machine offers, so a vertex reads as "share of what the
-/// system has" rather than against an arbitrary constant.
+/// The fixed reference this chart normalizes against.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// total RAM in MiB: 0 MiB of compositor plots at 1.0, all of it at 0.0
-    pub total_ram_mib: f64,
+    /// memory reference in MiB: 0 MiB plots at 1.0, the reference at 0.0
+    pub ram_reference_mib: f64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            total_ram_mib: FALLBACK_RAM_MIB,
+            ram_reference_mib: RAM_REFERENCE_MIB,
         }
     }
 }
@@ -50,28 +53,39 @@ const TITLES: [&str; 6] = [
     "PACING",
     "LOAD PACING",
     "RENDER COST",
-    "COMP RAM",
-    "COMP CPU",
+    "STACK RAM",
+    "STACK CPU",
     "FEATURES",
 ];
 const COLORS: [(f64, f64, f64); 6] = [
     (0.42, 0.62, 1.00), // blue    pacing, one surface
     (0.20, 0.78, 0.64), // teal    pacing under load
     (0.96, 0.72, 0.30), // amber   render cost
-    (0.35, 0.85, 0.60), // green   compositor RAM
-    (0.96, 0.46, 0.46), // red     compositor CPU
+    (0.35, 0.85, 0.60), // green   stack RAM
+    (0.96, 0.46, 0.46), // red     stack CPU
     (0.72, 0.55, 1.00), // violet  features
 ];
 
-/// Hover help: what each axis plots and which direction is good. Every axis is
-/// drawn "further out is better", including the cost axes, where the raw number
-/// is better when lower.
+/// Which way the number under the vertex should move. The radius is always
+/// "further out is better"; the cost axes plot the inverse of the printed
+/// number, so the vertex has to say so itself instead of leaving the reader
+/// with a cost labelled "higher is better".
+const BETTER: [&str; 6] = ["↑", "↑", "↓", "↓", "↓", "↑"];
+
+/// Width of the drawn direction marker. It is a path, not a glyph: the toy
+/// font stack the chart draws with has no guaranteed arrow coverage, and a
+/// missing glyph turns into a box on exactly the axes that need explaining.
+const ARROW_W: f64 = 5.0;
+
+/// Hover help: what each axis plots and which direction is good. The cost axes
+/// print a number that is better when lower, and are drawn inverted so that
+/// further out still means cheaper.
 const HELP: [&str; 6] = [
-    "Pacing: share of frames the compositor presented at the cadence it settled into, with one animated surface. Higher is better — 100 % means no frame was missed.",
+    "Pacing: delivered frames as a share of the panel refresh, with one animated surface. Higher is better — 100 % means the panel was fed every refresh. A deliberate 60 fps on a 120 Hz panel is 50 %.",
     "Pacing under load: the same share with the extra toplevels open, which is what a real desktop does all day. Higher is better.",
-    "Render cost: compositor CPU time per presented frame in the load test, as a share of the frame period at the observed cadence. Higher is better — further out means less CPU per frame.",
-    "Compositor memory: its process-tree PSS at rest, log-scaled against this machine's total RAM. Higher is better — further out means a smaller footprint.",
-    "Compositor CPU: its CPU at rest as a share of one core, log-scaled. Higher is better — further out means a quieter compositor.",
+    "Render cost: compositor CPU over the load test, scaled from the panel refresh to a common 60 Hz panel and shown as a share of one core, log-scaled so the 1–10 % range stays readable. Lower is better — the axis is inverted, so less CPU per panel refresh reaches further out.",
+    "Stack memory: compositor plus declared shell/panel PSS at rest, log-scaled against a fixed 8 GiB reference. Lower is better — the axis is inverted, so a smaller footprint reaches further out.",
+    "Stack CPU: compositor plus declared shell/panel CPU at rest as a share of one core, log-scaled. Lower is better — the axis is inverted, so a quieter desktop reaches further out.",
     "Features: scored Wayland protocol coverage (Core, Rendering and Desktop tiers). Higher is better.",
 ];
 
@@ -98,20 +112,22 @@ fn hit_index(boxes: &[HitBox; 6], x: f64, y: f64) -> Option<usize> {
 /// What the chart plots. Everything is expressed in the unit you would quote.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Values {
-    /// share of frames delivered at the observed cadence, 0..1
+    /// delivered frames as a share of the panel refresh, 0..1
     pub pacing_single: f64,
     pub pacing_multi: f64,
-    /// compositor CPU per presented frame, multi-surface test
-    pub comp_ms_per_frame: f64,
-    /// the cadence that test settled into: its period is the frame budget
-    pub cadence_hz: f64,
-    /// compositor process-tree PSS at rest
-    pub comp_pss_mib: f64,
-    /// compositor CPU at rest, % of one core
-    pub comp_cpu_pct: f64,
-    /// false when no compositor process was resolved: the two compositor axes
-    /// have no measurement, so they must not plot as zero cost
-    pub comp_known: bool,
+    /// compositor CPU in the load test, scaled from the panel refresh to a
+    /// common 60 Hz panel, % of one core
+    pub comp_cpu_pct_at_60hz: f64,
+    /// false when the render test produced no frames: a missing measurement
+    /// must not plot as a compositor that costs nothing per frame
+    pub render_known: bool,
+    /// compositor plus declared shell/panel PSS at rest
+    pub stack_pss_mib: f64,
+    /// compositor plus declared shell/panel CPU at rest, % of one core
+    pub stack_cpu_pct: f64,
+    /// false when no compositor process was resolved: the two stack axes have
+    /// no measurement, so they must not plot as zero cost
+    pub known: bool,
     pub feat_pct: f64,
 }
 
@@ -218,21 +234,26 @@ impl Radar {
         let l = self.limits;
         // Without a resolved compositor there is no cost to plot. The centre is
         // the "no data" position, matching the dash on the label: a missing
-        // compositor must not look like a compositor that costs nothing.
-        let (comp_ram, comp_cpu) = if v.comp_known {
+        // compositor must not look like a desktop that costs nothing.
+        let (stack_ram, stack_cpu) = if v.known {
             (
-                ram_norm(v.comp_pss_mib, l.total_ram_mib),
-                cpu_norm(v.comp_cpu_pct, 100.0),
+                ram_norm(v.stack_pss_mib, l.ram_reference_mib),
+                cpu_norm(v.stack_cpu_pct, 100.0),
             )
         } else {
             (0.0, 0.0)
         };
+        let render = if v.render_known {
+            render_cost_norm(v.comp_cpu_pct_at_60hz)
+        } else {
+            0.0
+        };
         self.values.borrow_mut().copy_from_slice(&[
             pacing_norm(v.pacing_single),
             pacing_norm(v.pacing_multi),
-            render_cost_norm(v.comp_ms_per_frame, v.cadence_hz),
-            comp_ram,
-            comp_cpu,
+            render,
+            stack_ram,
+            stack_cpu,
             (v.feat_pct / 100.0).clamp(0.0, 1.0),
         ]);
 
@@ -240,18 +261,18 @@ impl Radar {
             let mut t = self.texts.borrow_mut();
             t[0] = pacing_text(v.pacing_single);
             t[1] = pacing_text(v.pacing_multi);
-            t[2] = if v.comp_ms_per_frame > 0.0 {
-                format!("{:.1} ms", v.comp_ms_per_frame)
+            t[2] = if v.render_known {
+                crate::sysinfo::fmt_pct(v.comp_cpu_pct_at_60hz)
             } else {
                 "—".to_string()
             };
-            t[3] = if v.comp_known {
-                crate::sysinfo::fmt_mib(v.comp_pss_mib)
+            t[3] = if v.known {
+                crate::sysinfo::fmt_mib(v.stack_pss_mib)
             } else {
                 "—".to_string()
             };
-            t[4] = if v.comp_known {
-                crate::sysinfo::fmt_pct(v.comp_cpu_pct)
+            t[4] = if v.known {
+                crate::sysinfo::fmt_pct(v.stack_cpu_pct)
             } else {
                 "—".to_string()
             };
@@ -296,27 +317,26 @@ fn pacing_text(share: f64) -> String {
     }
 }
 
-/// `1.0` when the compositor uses no CPU per frame, `0.0` when one frame of
-/// work costs a whole frame period at the cadence it settled into. Measuring
-/// against the observed cadence, not the panel refresh, is what keeps a
-/// compositor that legitimately runs at 60 Hz on a 120 Hz panel from being
-/// judged against half the budget it actually needs.
-fn render_cost_norm(ms: f64, cadence_hz: f64) -> f64 {
-    let budget_ms = if cadence_hz > 1.0 {
-        1000.0 / cadence_hz
-    } else {
-        1000.0 / 60.0
-    };
-    (1.0 - ms.max(0.0) / budget_ms).clamp(0.0, 1.0)
+/// `1.0` when the compositor uses no CPU, `0.0` when a 60 Hz panel would take
+/// a whole core. Scaling the measured CPU by the panel rate is what keeps a
+/// 120 Hz panel from making the same work look cheaper — including when the
+/// client was deliberately throttled below the panel refresh.
+///
+/// Logarithmic for the same reason as the stack axes: a compositor lives in the
+/// 1–10 % range, and a linear axis turns 2 % and 8 % into 6 % of the radius,
+/// which is a pixel or two. Against a whole-core reference the log curve spreads
+/// that range over a third of the chart.
+fn render_cost_norm(cpu_pct_at_60hz: f64) -> f64 {
+    cpu_norm(cpu_pct_at_60hz, 100.0)
 }
 
-fn ram_norm(mib: f64, total_mib: f64) -> f64 {
-    let total = if total_mib > 1.0 {
-        total_mib
+fn ram_norm(mib: f64, reference_mib: f64) -> f64 {
+    let reference = if reference_mib > 1.0 {
+        reference_mib
     } else {
-        FALLBACK_RAM_MIB
+        RAM_REFERENCE_MIB
     };
-    let ratio = (1.0 + mib.max(0.0)).ln() / (1.0 + total).ln();
+    let ratio = (1.0 + mib.max(0.0)).ln() / (1.0 + reference).ln();
     (1.0 - ratio).clamp(0.0, 1.0)
 }
 
@@ -476,9 +496,13 @@ fn label_block(
     hot: bool,
 ) -> HitBox {
     let c = COLORS[i];
-    // The hit target is the widest of the two lines plus a little air, so the
-    // pointer does not have to land on a glyph.
-    let width = text_width(cr, TITLES[i], 9.5).max(text_width(cr, &texts[i], 15.5));
+    // The title and its direction marker are laid out as one run; the hit
+    // target is the widest of the two lines plus a little air, so the pointer
+    // does not have to land on a glyph.
+    let title_w = text_width(cr, TITLES[i], 9.5);
+    let arrow_w = ARROW_W;
+    let arrow_gap = 4.5;
+    let width = (title_w + arrow_gap + arrow_w).max(text_width(cr, &texts[i], 15.5));
     let (x0, x1) = match align {
         Align::Left => (x, x + width),
         Align::Center => (x - width / 2.0, x + width / 2.0),
@@ -493,15 +517,33 @@ fn label_block(
         cr.fill().ok();
     }
 
+    // Title + marker, aligned as a unit so the arrow never drifts away from the
+    // word it qualifies.
+    let run_w = title_w + arrow_gap + arrow_w;
+    let (title_x, arrow_x) = match align {
+        Align::Left => (x, x + title_w + arrow_gap),
+        Align::Center => {
+            let start = x - run_w / 2.0;
+            (start, start + title_w + arrow_gap)
+        }
+        Align::Right => (x - run_w, x - arrow_w),
+    };
     text(
         cr,
         gtk::cairo::FontWeight::Bold,
-        x,
+        title_x,
         y + 9.0,
-        align,
+        Align::Left,
         TITLES[i],
         9.5,
         (c.0 * 0.8 + 0.2, c.1 * 0.8 + 0.2, c.2 * 0.8 + 0.2, 0.92),
+    );
+    direction_marker(
+        cr,
+        arrow_x,
+        y + 9.0,
+        BETTER[i] == "↑",
+        (c.0 * 0.8 + 0.2, c.1 * 0.8 + 0.2, c.2 * 0.8 + 0.2, 0.75),
     );
     text(
         cr,
@@ -520,6 +562,35 @@ fn label_block(
         x1: x1 + pad,
         y1,
     }
+}
+
+/// Small arrow next to an axis title, pointing the way its number should move.
+/// Drawn as a shaft plus two head strokes so it matches the weight of the 9.5 pt
+/// label instead of sitting on the baseline as a symbol glyph would.
+fn direction_marker(
+    cr: &gtk::cairo::Context,
+    x: f64,
+    baseline: f64,
+    up: bool,
+    rgba: (f64, f64, f64, f64),
+) {
+    let h = 7.0;
+    let cx = x + ARROW_W / 2.0;
+    let (head, tail) = if up {
+        (baseline - h, baseline - 1.0)
+    } else {
+        (baseline - 1.0, baseline - h)
+    };
+    let barb = if up { 2.8 } else { -2.8 };
+    cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
+    cr.set_line_width(1.3);
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.move_to(cx, tail);
+    cr.line_to(cx, head);
+    cr.move_to(x, head + barb);
+    cr.line_to(cx, head);
+    cr.line_to(x + ARROW_W, head + barb);
+    cr.stroke().ok();
 }
 
 fn text_width(cr: &gtk::cairo::Context, s: &str, size: f64) -> f64 {
@@ -581,19 +652,17 @@ mod tests {
             }
         }
         for mib in [0.0, 120.0, 2048.0, 4096.0, 30720.0] {
-            for total in [2048.0, 30720.0] {
-                let n = ram_norm(mib, total);
-                assert!((0.0..=1.0).contains(&n), "ram_norm({mib}, {total}) = {n}");
-            }
-        }
-        for ms in [0.0, 0.5, 8.3, 16.7, 40.0] {
-            for hz in [0.0, 60.0, 120.0] {
-                let n = render_cost_norm(ms, hz);
+            for reference in [2048.0, 8192.0] {
+                let n = ram_norm(mib, reference);
                 assert!(
                     (0.0..=1.0).contains(&n),
-                    "render_cost_norm({ms}, {hz}) = {n}"
+                    "ram_norm({mib}, {reference}) = {n}"
                 );
             }
+        }
+        for pct in [0.0, 0.5, 3.0, 6.0, 40.0, 100.0, 250.0] {
+            let n = render_cost_norm(pct);
+            assert!((0.0..=1.0).contains(&n), "render_cost_norm({pct}) = {n}");
         }
         for share in [-0.5, 0.0, 0.73, 1.0, 2.0] {
             let n = pacing_norm(share);
@@ -605,43 +674,64 @@ mod tests {
     fn zero_capacity_falls_back_instead_of_dividing_by_zero() {
         assert!(ram_norm(500.0, 0.0).is_finite());
         assert!(cpu_norm(5.0, 0.0).is_finite());
-        assert!(render_cost_norm(5.0, 0.0).is_finite());
+        assert!(render_cost_norm(5.0).is_finite());
     }
 
     #[test]
     fn further_out_is_better() {
-        assert!(ram_norm(100.0, 30720.0) > ram_norm(900.0, 30720.0));
+        assert!(ram_norm(100.0, 8192.0) > ram_norm(900.0, 8192.0));
         assert!(cpu_norm(0.5, 100.0) > cpu_norm(5.0, 100.0));
         assert!(cpu_norm(5.0, 100.0) > cpu_norm(25.0, 100.0));
         assert!(pacing_norm(0.99) > pacing_norm(0.73));
-        assert!(render_cost_norm(2.0, 60.0) > render_cost_norm(10.0, 60.0));
+        assert!(render_cost_norm(2.0) > render_cost_norm(10.0));
     }
 
     #[test]
-    fn scale_follows_the_machine() {
-        // the same footprint plots further out on a bigger machine
-        assert!(ram_norm(900.0, 30720.0) > ram_norm(900.0, 4096.0));
-        // the full capacity pins to the centre
-        assert!((cpu_norm(100.0, 100.0) - 0.0).abs() < 1e-9);
-        assert!((ram_norm(30720.0, 30720.0) - 0.0).abs() < 1e-9);
+    fn the_memory_reference_is_fixed_not_the_machine() {
+        // The chart always normalizes against the same 8 GiB constant, so the
+        // vertex is about the stack, not about how much RAM the machine has.
+        assert_eq!(Limits::default().ram_reference_mib, RAM_REFERENCE_MIB);
+        // the full reference pins to the centre, a larger footprint further in
+        assert!((ram_norm(RAM_REFERENCE_MIB, RAM_REFERENCE_MIB) - 0.0).abs() < 1e-9);
+        assert!(ram_norm(900.0, RAM_REFERENCE_MIB) > ram_norm(2000.0, RAM_REFERENCE_MIB));
     }
 
     #[test]
-    fn render_cost_is_measured_against_the_observed_cadence() {
-        // a whole frame period of CPU per frame is the centre, at any cadence
-        assert!(render_cost_norm(1000.0 / 60.0, 60.0) < 1e-9);
-        assert!(render_cost_norm(1000.0 / 120.0, 120.0) < 1e-9);
-        // and no CPU per frame is the outer ring
-        assert!((render_cost_norm(0.0, 60.0) - 1.0).abs() < 1e-9);
-        // the same ms/frame is cheaper at a lower cadence
-        assert!(render_cost_norm(8.0, 60.0) > render_cost_norm(8.0, 120.0));
+    fn render_cost_is_a_share_of_one_core_at_60hz() {
+        // no CPU is the outer ring; a whole core at 60 Hz is the centre
+        assert!((render_cost_norm(0.0) - 1.0).abs() < 1e-9);
+        assert!(render_cost_norm(100.0) < 1e-9);
+        // less CPU at a 60 Hz panel plots further out
+        assert!(render_cost_norm(3.0) > render_cost_norm(6.0));
     }
 
     #[test]
-    fn pacing_does_not_punish_a_60hz_cadence_on_a_120hz_panel() {
-        // 60 fps at a 60 Hz cadence delivered every frame is a full axis;
-        // fps / panel_refresh would have plotted 0.5
+    fn the_render_axis_spreads_the_range_a_compositor_lives_in() {
+        // A compositor sits in the low single digits. A linear axis gave 2 %
+        // and 8 % only 6 % of the radius apart — two pixels, i.e. nothing.
+        let spread = render_cost_norm(2.0) - render_cost_norm(8.0);
+        assert!(spread > 0.20, "2 % vs 8 % only {spread:.3} of the radius");
+        // and a genuinely expensive compositor still lands near the centre
+        assert!(render_cost_norm(50.0) < 0.2);
+        // the axis is monotonic, with no cliff in the middle
+        let mut prev = f64::INFINITY;
+        for pct in [0.0, 0.3, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0] {
+            let n = render_cost_norm(pct);
+            assert!(
+                n < prev,
+                "{pct} % did not plot further in than the step before"
+            );
+            prev = n;
+        }
+    }
+
+    #[test]
+    fn pacing_is_a_share_of_the_panel_refresh() {
+        // 60 fps on a 120 Hz panel is half the panel, and that is the point:
+        // the same number a 60 Hz panel would give for 30 fps.
+        assert!((pacing_norm(0.5) - 0.5).abs() < 1e-9);
         assert!((pacing_norm(1.0) - 1.0).abs() < 1e-9);
+        assert!(pacing_norm(1.0) > pacing_norm(0.5));
     }
 
     #[test]
@@ -662,8 +752,26 @@ mod tests {
 
     #[test]
     fn every_axis_says_which_direction_is_better() {
-        for help in HELP {
-            assert!(help.contains("Higher is better"), "{help}");
+        for (i, help) in HELP.iter().enumerate() {
+            let expected = if BETTER[i] == "↓" {
+                "Lower is better"
+            } else {
+                "Higher is better"
+            };
+            assert!(help.contains(expected), "{help}");
+        }
+    }
+
+    #[test]
+    fn the_cost_axes_are_the_inverted_ones() {
+        // A cost is better when lower, so these three print a number whose
+        // good direction is down even though their vertex grows outwards.
+        for i in [2, 3, 4] {
+            assert_eq!(BETTER[i], "↓", "axis {} ({})", i, TITLES[i]);
+            assert!(HELP[i].contains("inverted"), "{}", HELP[i]);
+        }
+        for i in [0, 1, 5] {
+            assert_eq!(BETTER[i], "↑", "axis {} ({})", i, TITLES[i]);
         }
     }
 }

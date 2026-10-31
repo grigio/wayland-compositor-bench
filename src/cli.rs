@@ -23,8 +23,16 @@ OPTIONS:
                         compositor process)
     --settle SECONDS    max time to wait for the session to go quiet (default 45)
     --idle SECONDS      idle sampling window (default 20)
-    --frames SECONDS    length of each frame test (default 6)
+    --frames SECONDS    length of each frame test (default 6; reference 10)
     --windows N         extra toplevels (default 6)
+    --stack auto|none|NAME,…
+                        shell/panel/notification processes to attribute in
+                        addition to the compositor (default auto)
+    --profile native|reference
+                        native measures the session as configured; reference
+                        turns blur off, targets 60 Hz and uses a 10 s frame test
+    --target-hz HZ      throttle the benchmark client to HZ; 0 = native refresh
+    --strict            make --compare fail when the two sides are not comparable
     --report [PATH…]    aggregate results: a directory, JSON files, or
                         label substrings; no PATH means the XDG results
                         directory plus ./results
@@ -49,6 +57,34 @@ pub enum JsonTarget {
     Path(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// The session as it is configured.
+    #[default]
+    Native,
+    /// A deliberately stripped workload: blur off, 60 Hz target, longer test.
+    Reference,
+}
+
+impl Profile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Profile::Native => "native",
+            Profile::Reference => "reference",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "native" => Ok(Profile::Native),
+            "reference" => Ok(Profile::Reference),
+            other => Err(format!(
+                "--profile: expected native or reference, got {other}"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub run: bool,
@@ -63,6 +99,12 @@ pub struct Options {
     pub idle_s: f64,
     pub frames_s: f64,
     pub windows: u32,
+    /// `auto`, `none`, or a comma-separated list of shell/panel names.
+    pub stack: String,
+    pub profile: Profile,
+    /// 0 means "draw at the panel's native rate".
+    pub target_hz: f64,
+    pub strict: bool,
     pub help: bool,
     pub version: bool,
 }
@@ -81,6 +123,10 @@ impl Default for Options {
             idle_s: 20.0,
             frames_s: 6.0,
             windows: 6,
+            stack: "auto".into(),
+            profile: Profile::Native,
+            target_hz: 0.0,
+            strict: false,
             help: false,
             version: false,
         }
@@ -91,6 +137,8 @@ impl Options {
     pub fn parse<I: Iterator<Item = String>>(args: I) -> Result<Self, String> {
         let mut o = Self::default();
         let mut it = args.peekable();
+        let mut frames_given = false;
+        let mut target_given = false;
 
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -117,8 +165,28 @@ impl Options {
                 "--label" => o.label = Some(it.next().ok_or("--label needs a value")?),
                 "--settle" => o.settle_s = number(it.next(), "--settle")?,
                 "--idle" => o.idle_s = number(it.next(), "--idle")?,
-                "--frames" => o.frames_s = number(it.next(), "--frames")?,
+                "--frames" => {
+                    o.frames_s = number(it.next(), "--frames")?;
+                    frames_given = true;
+                }
                 "--windows" => o.windows = number::<u32>(it.next(), "--windows")?,
+                "--stack" => {
+                    let v = it.next().ok_or("--stack needs a value")?;
+                    let v = v.trim().to_ascii_lowercase();
+                    if v.is_empty() {
+                        return Err("--stack needs auto, none, or a process name".into());
+                    }
+                    o.stack = v;
+                }
+                "--profile" => {
+                    let v = it.next().ok_or("--profile needs a value")?;
+                    o.profile = Profile::parse(&v)?;
+                }
+                "--target-hz" => {
+                    o.target_hz = number(it.next(), "--target-hz")?;
+                    target_given = true;
+                }
+                "--strict" => o.strict = true,
                 other if other.starts_with("--") => {
                     return Err(format!("unknown option {other}"));
                 }
@@ -131,14 +199,32 @@ impl Options {
             }
         }
 
-        if !o.idle_s.is_finite() || !o.frames_s.is_finite() || !o.settle_s.is_finite() {
-            return Err("--idle, --frames and --settle must be finite numbers".into());
+        if o.profile == Profile::Reference {
+            if !frames_given {
+                o.frames_s = 10.0;
+            }
+            if !target_given {
+                o.target_hz = 60.0;
+            }
+        }
+        if !o.idle_s.is_finite()
+            || !o.frames_s.is_finite()
+            || !o.settle_s.is_finite()
+            || !o.target_hz.is_finite()
+        {
+            return Err("--idle, --frames, --settle and --target-hz must be finite numbers".into());
         }
         if o.idle_s < 1.0 || o.frames_s < 1.0 {
             return Err("--idle and --frames must be at least 1 second".into());
         }
         if o.settle_s < 0.0 {
             return Err("--settle must not be negative".into());
+        }
+        if o.target_hz != 0.0 && !(1.0..=1000.0).contains(&o.target_hz) {
+            return Err("--target-hz must be 0 (native) or between 1 and 1000".into());
+        }
+        if o.strict && o.compare.is_none() {
+            return Err("--strict only applies to --compare".into());
         }
         Ok(o)
     }
@@ -236,6 +322,86 @@ mod tests {
                 "{flag} inf must not reach Duration::from_secs_f64"
             );
         }
+        assert!(
+            Options::parse(["--target-hz".to_string(), "NaN".to_string()].into_iter()).is_err()
+        );
+    }
+
+    #[test]
+    fn reference_profile_defaults_to_60hz_and_a_longer_test() {
+        let o = parse(&["--run", "--profile", "reference"]);
+        assert_eq!(o.profile, Profile::Reference);
+        assert_eq!(o.target_hz, 60.0);
+        assert_eq!(o.frames_s, 10.0);
+        // an explicit value still wins over the profile default
+        let o = parse(&["--run", "--profile", "reference", "--target-hz", "90"]);
+        assert_eq!(o.target_hz, 90.0);
+        assert_eq!(o.frames_s, 10.0);
+        let o = parse(&["--run", "--profile", "reference", "--frames", "4"]);
+        assert_eq!(o.frames_s, 4.0);
+        assert_eq!(o.target_hz, 60.0);
+    }
+
+    #[test]
+    fn native_profile_leaves_the_session_alone() {
+        let o = parse(&["--run"]);
+        assert_eq!(o.profile, Profile::Native);
+        assert_eq!(o.target_hz, 0.0);
+        assert_eq!(o.frames_s, 6.0);
+    }
+
+    #[test]
+    fn target_hz_is_bounded() {
+        assert!(Options::parse(
+            [
+                "--run".to_string(),
+                "--target-hz".to_string(),
+                "0".to_string()
+            ]
+            .into_iter()
+        )
+        .is_ok());
+        assert!(Options::parse(
+            [
+                "--run".to_string(),
+                "--target-hz".to_string(),
+                "1001".to_string()
+            ]
+            .into_iter()
+        )
+        .is_err());
+        assert!(Options::parse(
+            [
+                "--run".to_string(),
+                "--target-hz".to_string(),
+                "-1".to_string()
+            ]
+            .into_iter()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stack_selector_is_normalized() {
+        let o = parse(&["--run", "--stack", " Noctalia, Waybar "]);
+        assert_eq!(o.stack, "noctalia, waybar");
+        assert_eq!(parse(&["--run"]).stack, "auto");
+        assert_eq!(parse(&["--run", "--stack", "none"]).stack, "none");
+    }
+
+    #[test]
+    fn strict_only_makes_sense_when_comparing() {
+        assert!(Options::parse(
+            [
+                "--compare".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+                "--strict".to_string()
+            ]
+            .into_iter()
+        )
+        .is_ok());
+        assert!(Options::parse(["--run".to_string(), "--strict".to_string()].into_iter()).is_err());
     }
 
     #[test]

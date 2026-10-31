@@ -35,6 +35,13 @@ enum Scope {
     /// shell, session services and app scopes — here, outside the login
     /// session scope.
     UserManager,
+    /// The login session scope *and* the user manager. A desktop can span
+    /// both: logind starts the compositor in `session-N.scope`, while a panel,
+    /// notification daemon or portal started from a systemd user unit lives
+    /// under `user@UID.service` (labwc + Noctalia, a compositor plus a
+    /// user-service shell). Measuring only one of the two halves would compare
+    /// half a desktop.
+    LoginAndUserManager,
     /// The user slice, which also contains other sessions of the same user.
     /// Only used when neither of the above is available.
     UserSlice,
@@ -48,8 +55,31 @@ impl Scope {
 }
 
 struct ScopeDir {
-    dir: PathBuf,
+    /// One directory normally; the login scope plus the user manager when the
+    /// desktop spans both. Disjoint subtrees, so their counters add up.
+    dirs: Vec<PathBuf>,
     kind: Scope,
+}
+
+/// Combine the scope the benchmark runs in with the systemd user manager.
+///
+/// A login session scope and `user@UID.service` are siblings under
+/// `user.slice`, so a desktop that puts the compositor in one and the panel in
+/// the other must be measured as the union. Pure so the rule is testable
+/// without cgroup v2.
+fn combine_scopes(
+    primary: PathBuf,
+    kind: Scope,
+    user_manager: Option<PathBuf>,
+) -> (Vec<PathBuf>, Scope) {
+    if kind == Scope::Login {
+        if let Some(um) = user_manager {
+            if um != primary {
+                return (vec![primary, um], Scope::LoginAndUserManager);
+            }
+        }
+    }
+    (vec![primary], kind)
 }
 
 /// `/proc/self/cgroup`'s cgroup v2 path → the directory to measure.
@@ -94,22 +124,35 @@ fn scope_dir() -> &'static ScopeDir {
         // `memory.current` proves the memory controller is enabled on the
         // directory. A session or user manager without it cannot be measured,
         // so the user slice is the last resort.
-        if kind.exact() && dir.join("memory.current").exists() {
-            return ScopeDir { dir, kind };
+        if kind == Scope::Login && dir.join("memory.current").exists() {
+            let um = PathBuf::from(format!(
+                "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+            ));
+            let um = um.join("memory.current").exists().then_some(um);
+            let (dirs, kind) = combine_scopes(dir, kind, um);
+            return ScopeDir { dirs, kind };
+        }
+        if kind == Scope::UserManager && dir.join("memory.current").exists() {
+            return ScopeDir {
+                dirs: vec![dir],
+                kind,
+            };
         }
         ScopeDir {
-            dir: PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice")),
+            dirs: vec![PathBuf::from(format!(
+                "/sys/fs/cgroup/user.slice/user-{uid}.slice"
+            ))],
             kind: Scope::UserSlice,
         }
     })
 }
 
-/// The cgroup of this session: its `session-N.scope`, or the systemd user
-/// manager that hosts the desktop (`GNOME`, `Plasma`). Falls back to the user
-/// slice when neither exists (some greeters, TTY-started compositors,
-/// containers).
-pub fn session_cgroup() -> &'static Path {
-    &scope_dir().dir
+/// The cgroups this session is measured from: its `session-N.scope`, the
+/// systemd user manager that hosts the desktop (`GNOME`, `Plasma`), or both
+/// when the compositor and the shell live in different halves. Falls back to
+/// the user slice when neither exists (some greeters, containers).
+pub fn session_cgroups() -> &'static [PathBuf] {
+    &scope_dir().dirs
 }
 
 /// False only when we fell back to the user slice, which also contains other
@@ -120,11 +163,95 @@ pub fn cgroup_exact() -> bool {
 
 /// Human name of the resolved scope, for `--check`.
 pub fn cgroup_label() -> &'static str {
-    match scope_dir().kind {
+    cgroup_label_str(scope_dir().kind)
+}
+
+fn cgroup_label_str(kind: Scope) -> &'static str {
+    match kind {
         Scope::Login => "login session scope",
         Scope::UserManager => "systemd user manager",
+        Scope::LoginAndUserManager => "login session scope + systemd user manager",
         Scope::UserSlice => "user slice fallback",
     }
+}
+
+/// Stable machine-readable name for the resolved scope. Two runs measured on
+/// different kinds of cgroup are not the same session measurement, even when
+/// both are exact, so this travels in the JSON and `--compare` warns on it.
+pub fn cgroup_kind() -> &'static str {
+    cgroup_kind_str(scope_dir().kind)
+}
+
+fn cgroup_kind_str(kind: Scope) -> &'static str {
+    match kind {
+        Scope::Login => "login-session",
+        Scope::UserManager => "user-manager",
+        Scope::LoginAndUserManager => "login-session+user-manager",
+        Scope::UserSlice => "user-slice",
+    }
+}
+
+/// The measured cgroup paths as one printable string, for `--check` and JSON.
+pub fn cgroup_paths() -> String {
+    session_cgroups()
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Session CPU time summed over every measured cgroup.
+pub fn session_cpu_usec() -> u64 {
+    session_cgroups().iter().map(|d| cpu_usage_usec(d)).sum()
+}
+
+/// Every process in the measured cgroups. The subtrees are disjoint, so the
+/// concatenation is the union.
+pub fn session_pids() -> Vec<u32> {
+    let mut out = Vec::new();
+    for dir in session_cgroups() {
+        out.extend(pids_in_cgroup(dir));
+    }
+    out
+}
+
+/// `memory.stat` summed over the measured cgroups.
+pub fn session_mem_stat() -> MemStat {
+    let mut out = MemStat::default();
+    for dir in session_cgroups() {
+        let m = mem_stat(dir);
+        out.anon += m.anon;
+        out.file += m.file;
+        out.shmem += m.shmem;
+        out.kernel += m.kernel;
+        out.slab += m.slab;
+        out.sock += m.sock;
+    }
+    out
+}
+
+/// `memory.current` summed over the measured cgroups.
+pub fn session_memory_current_mib() -> f64 {
+    session_cgroups()
+        .iter()
+        .map(|d| read_u64(d.join("memory.current").to_string_lossy().as_ref()).unwrap_or(0))
+        .sum::<u64>() as f64
+        / 1048576.0
+}
+
+/// `memory.swap.current` summed over the measured cgroups.
+pub fn session_swap_current_mib() -> f64 {
+    session_cgroups()
+        .iter()
+        .map(|d| read_u64(d.join("memory.swap.current").to_string_lossy().as_ref()).unwrap_or(0))
+        .sum::<u64>() as f64
+        / 1048576.0
+}
+
+/// Sum of the per-cgroup high-water marks. Each kernel peak is its own maximum,
+/// so this is an upper bound on the union's peak, never a lower one.
+pub fn session_memory_peak_mib() -> f64 {
+    session_cgroups().iter().map(|d| memory_peak_mib(d)).sum()
 }
 
 pub fn cpu_usage_usec(dir: &Path) -> u64 {
@@ -227,6 +354,41 @@ pub fn stat(pid: u32) -> Option<Stat> {
 
 pub fn comm(pid: u32) -> Option<String> {
     read(&format!("/proc/{pid}/comm"))
+}
+
+/// Full command line with NUL separators turned into spaces. `comm` is capped
+/// at 15 bytes, so a shell like `xdg-desktop-portal-gnome` needs this to be
+/// identified reliably.
+pub fn cmdline(pid: u32) -> String {
+    read(&format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .replace('\0', " ")
+        .trim()
+        .to_string()
+}
+
+/// Human-readable process name. `comm` is capped at 15 bytes, so a long name
+/// arrives truncated (`xdg-desktop-por`); when that happens the basename of
+/// `argv[0]` is more informative. It is only a label: matching still checks
+/// both `comm` and the command line.
+pub fn display_name(pid: u32) -> Option<String> {
+    let comm = comm(pid)?;
+    if comm.len() < 15 {
+        return Some(comm);
+    }
+    let cmd = cmdline(pid);
+    let base = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    Some(if base.is_empty() {
+        comm
+    } else {
+        base.to_string()
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -442,21 +604,22 @@ fn clock_ticks() -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct CpuSnapshot {
     pub total_usec: u64,
-    /// (pid, comm, CPU ns) for every process in the session cgroup
+    /// (pid, comm, CPU ns) for every process in the measured cgroups
     pub procs: Vec<(u32, String, u64)>,
 }
 
-/// Per-process `utime + stime` for the session cgroup, without re-reading the
+/// Per-process `utime + stime` for every measured cgroup, without re-reading the
 /// cgroup total. Used when the total comes from a different, tighter instant.
 pub fn cpu_procs() -> Vec<(u32, String, u64)> {
-    pids_in_cgroup(session_cgroup())
-        .into_iter()
-        .filter_map(|pid| {
+    let mut out = Vec::new();
+    for dir in session_cgroups() {
+        out.extend(pids_in_cgroup(dir).into_iter().filter_map(|pid| {
             let ns = cpu_time_ns(pid)?;
             let name = comm(pid).unwrap_or_else(|| format!("pid {pid}"));
             Some((pid, name, ns))
-        })
-        .collect()
+        }));
+    }
+    out
 }
 
 // ------------------------------------------------------------------- gpu ---
@@ -862,10 +1025,10 @@ fn socket_compositor() -> Option<Compositor> {
 }
 
 /// Fallback for compositors that hand out a display socket we cannot resolve:
-/// oldest known name inside the session cgroup.
+/// oldest known name inside the measured cgroups.
 fn name_compositor() -> Option<Compositor> {
     let mut best: Option<(u32, String)> = None;
-    for pid in pids_in_cgroup(session_cgroup()) {
+    for pid in session_pids() {
         let Some(name) = comm(pid) else { continue };
         if KNOWN.contains(&name.as_str()) && best.as_ref().map(|(p, _)| pid < *p).unwrap_or(true) {
             best = Some((pid, name));
@@ -1058,15 +1221,21 @@ mod tests {
     }
 
     #[test]
-    fn session_cgroup_exists_on_linux() {
-        let dir = session_cgroup();
+    fn session_cgroups_exist_on_linux() {
+        let dirs = session_cgroups();
         // Containers and CI runners have a cgroup hierarchy but no login
         // session scope: nothing to assert, so skip rather than fail.
-        if !dir.join("memory.current").exists() {
-            eprintln!("skipping: {} has no memory.current", dir.display());
+        if !dirs.iter().any(|d| d.join("memory.current").exists()) {
+            eprintln!("skipping: no measured cgroup has memory.current");
             return;
         }
-        assert!(dir.join("memory.current").exists());
+        for dir in dirs {
+            assert!(
+                dir.join("memory.current").exists(),
+                "{} has no memory.current",
+                dir.display()
+            );
+        }
     }
 
     #[test]
@@ -1092,6 +1261,45 @@ mod tests {
             dir,
             Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/session-2.scope")
         );
+    }
+
+    #[test]
+    fn a_login_scope_and_the_user_manager_are_measured_together() {
+        // labwc from logind, Noctalia from `noctalia.service`: measuring only
+        // the login scope would miss the panel entirely.
+        let (dirs, kind) = combine_scopes(
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/session-7.scope"),
+            Scope::Login,
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+            )),
+        );
+        assert_eq!(kind, Scope::LoginAndUserManager);
+        assert_eq!(dirs.len(), 2);
+        assert!(cgroup_kind_str(kind).contains("login-session"));
+        assert!(cgroup_label_str(kind).contains("user manager"));
+    }
+
+    #[test]
+    fn one_scope_is_not_duplicated() {
+        let (dirs, kind) = combine_scopes(
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"),
+            Scope::UserManager,
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+            )),
+        );
+        assert_eq!(kind, Scope::UserManager);
+        assert_eq!(dirs.len(), 1);
+        // The same rule must hold for a login scope that equals the manager
+        // path only in a test: nothing is added twice.
+        let (dirs, kind) = combine_scopes(
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/session-7.scope"),
+            Scope::Login,
+            None,
+        );
+        assert_eq!(kind, Scope::Login);
+        assert_eq!(dirs.len(), 1);
     }
 
     #[test]
@@ -1139,20 +1347,16 @@ mod tests {
     }
 
     #[test]
-    fn pids_in_cgroup_on_this_session_includes_this_process() {
-        let pids = pids_in_cgroup(session_cgroup());
+    fn pids_in_the_measured_cgroups_include_this_process() {
+        let pids = session_pids();
         if pids.is_empty() {
-            eprintln!(
-                "skipping: {} has no nested processes",
-                session_cgroup().display()
-            );
+            eprintln!("skipping: the measured cgroups have no nested processes");
             return;
         }
         assert!(
             pids.contains(&std::process::id()),
-            "own pid {} missing from {}",
-            std::process::id(),
-            session_cgroup().display()
+            "own pid {} missing from the measured cgroups",
+            std::process::id()
         );
     }
 

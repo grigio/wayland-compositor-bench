@@ -4,6 +4,55 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-10-31
+
+### Added
+
+- **Desktop-stack scopes.** `core` is the compositor process tree; `stack` adds
+  the separate shell/panel/notification processes (Waybar, Noctalia,
+  Quickshell, SwayNC, portals, …). `--stack auto|none|NAME,…` picks the scope,
+  the JSON records the selector, the style (`integrated`/`modular`) and every
+  added process, and the idle table reports both scopes plus `unrelated CPU`.
+  This stops a GNOME desktop, whose shell lives inside `gnome-shell`, from being
+  compared with a bare labwc compositor.
+- **The measured session can be two cgroups.** When logind holds the compositor
+  (`session-N.scope`) and the panel or portals are systemd user services
+  (`user@UID.service`), both are measured and summed. `cgroup_kind` reports
+  `login-session+user-manager`, and the JSON `cgroup` field lists both paths.
+  PSI reports the higher of the two, since pressure is a share of wall time and
+  cannot be added. Without this, a labwc + Noctalia desktop lost its panel from
+  every session and stack figure.
+- `--profile native|reference`: `reference` starts with blur off, targets 60 Hz
+  and uses a 10 s frame test, so the render comparison measures the compositor
+  rather than the session's configuration.
+- `--target-hz HZ` throttles the benchmark client to a fixed rate.
+- Panel-relative pacing: `pacing_vs_panel`, `dropped_vs_panel`,
+  `p95_over_panel`, and `comp_cpu_pct_at_60hz`, which scales compositor CPU from
+  the panel refresh to a common 60 Hz panel. A deliberate 60 fps on a 120 Hz
+  panel is now 50 % of the panel.
+- `--strict` makes `--compare` fail when the two sides are not comparable.
+- `cgroup_kind` in the JSON, and `self_pss_mib` / `mem_excl_self_mib` so the
+  session memory can be read without the benchmark client.
+
+### Changed
+
+- The radar plots stack RAM and stack CPU against a fixed 8 GiB memory
+  reference, panel-relative pacing, and render cost at a common 60 Hz panel.
+- Each radar vertex now carries the direction its own number should move: `↓`
+  on render cost, stack RAM and stack CPU, `↑` on pacing and features. The cost
+  axes are drawn inverted (a lower number lands further out), so the hover help
+  said "Higher is better" next to a raw cost percentage — it now says "Lower is
+  better" and explains the inversion.
+- Render cost is log-scaled like the two stack axes. The old linear `1 - CPU %`
+  put every realistic compositor between 0.92 and 0.99 of the radius, so 2 % and
+  8 % of a core looked identical.
+- `Stats::noise()` includes a MAD term; `--compare` labels fewer than three
+  runs per label `anecdotal` instead of declaring a winner.
+- `--compare` warns on different cgroup kinds, stack styles, workload profiles,
+  blur states, power settings and presentation-feedback sources.
+- `other_cpu_pct` keeps its v3 meaning; the `quiet cpu` check and its offender
+  list now use `unrelated_cpu_pct`, which excludes the declared stack.
+
 ## [0.5.0] — 2026-10-30
 
 ### Added

@@ -62,9 +62,8 @@ impl Snapshot {
     /// Start of a measured window: scan first, then read the counters, then
     /// timestamp. The scan is therefore *before* the window, not inside it.
     pub fn begin(comp_pid: Option<u32>) -> Self {
-        let dir = proc::session_cgroup();
         let mut snap = Self::take_light();
-        snap.procs = proc::pids_in_cgroup(dir).len();
+        snap.procs = proc::session_pids().len();
         snap.comp_pss_mib = comp_pid
             .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
             .unwrap_or(0.0);
@@ -74,7 +73,7 @@ impl Snapshot {
         snap.comp_wakeups = comp_pid.map(proc::process_wakeups).unwrap_or(0);
         // Counters last: everything above is the benchmark's own work and is
         // deliberately excluded from the interval.
-        snap.cpu_usec = proc::cpu_usage_usec(dir);
+        snap.cpu_usec = proc::session_cpu_usec();
         snap.at = Instant::now();
         snap
     }
@@ -82,8 +81,7 @@ impl Snapshot {
     /// End of a measured window: read the counters first, then scan, then keep
     /// the timestamp taken before the scan. The scan is *after* the window.
     pub fn end(comp_pid: Option<u32>) -> Self {
-        let dir = proc::session_cgroup();
-        let cpu_usec = proc::cpu_usage_usec(dir);
+        let cpu_usec = proc::session_cpu_usec();
         let at = Instant::now();
         let mut snap = Self::take_light();
         snap.cpu_usec = cpu_usec;
@@ -92,7 +90,7 @@ impl Snapshot {
         snap.comp_tasks = comp_pid.map(proc::tasks).unwrap_or_default();
         snap.comp_ns = snap.comp_tasks.iter().map(|t| t.ns).sum();
         snap.comp_wakeups = comp_pid.map(proc::process_wakeups).unwrap_or(0);
-        snap.procs = proc::pids_in_cgroup(dir).len();
+        snap.procs = proc::session_pids().len();
         snap.comp_pss_mib = comp_pid
             .map(|p| proc::pss_tree(p).0 as f64 / 1024.0)
             .unwrap_or(0.0);
@@ -102,20 +100,15 @@ impl Snapshot {
     /// The cgroup counters the 1 s live labels need, without the `/proc` walk
     /// and `smaps_rollup` that make `take` expensive.
     pub fn take_light() -> Self {
-        let dir = proc::session_cgroup();
-        let m = proc::mem_stat(dir);
+        let m = proc::session_mem_stat();
         Self {
-            total_mib: proc::read_u64(dir.join("memory.current").to_string_lossy().as_ref())
-                .unwrap_or(0) as f64
-                / 1048576.0,
+            total_mib: proc::session_memory_current_mib(),
             anon_mib: m.anon,
             shmem_mib: m.shmem,
             file_mib: m.file,
             kernel_mib: m.kernel,
-            swap_mib: proc::read_u64(dir.join("memory.swap.current").to_string_lossy().as_ref())
-                .unwrap_or(0) as f64
-                / 1048576.0,
-            cpu_usec: proc::cpu_usage_usec(dir),
+            swap_mib: proc::session_swap_current_mib(),
+            cpu_usec: proc::session_cpu_usec(),
             comp_ns: 0,
             comp_tasks: Vec::new(),
             comp_wakeups: 0,
@@ -150,7 +143,7 @@ impl Snapshot {
 /// the benchmark itself.
 pub fn contaminants(exclude: &[u32]) -> Vec<(String, f64)> {
     let mut out = Vec::new();
-    for pid in proc::pids_in_cgroup(proc::session_cgroup()) {
+    for pid in proc::session_pids() {
         if exclude.contains(&pid) {
             continue;
         }
@@ -378,6 +371,20 @@ pub fn throttled() -> bool {
         }
     }
     any
+}
+
+/// The highest `(some, full)` avg10 across the measured cgroups.
+///
+/// Pressure is a share of wall time, so sibling cgroups cannot be added: a
+/// task in the login scope and one in the user manager can stall at the same
+/// instant. Reading only the primary would hide a panel or portal stalling in
+/// the other half, so the reported value is the maximum, a floor for the
+/// desktop rather than a sum that double-counts.
+pub fn psi_max(file: &str) -> Option<(f64, f64)> {
+    proc::session_cgroups()
+        .iter()
+        .filter_map(|cg| psi(cg, file))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
 pub fn psi(c: &std::path::Path, file: &str) -> Option<(f64, f64)> {
@@ -887,7 +894,10 @@ mod tests {
         // A container or a CI runner has no login session scope, so there is
         // no working set to assert on: skip instead of failing a build for a
         // property of the machine, not of the code.
-        if !proc::session_cgroup().join("memory.current").exists() {
+        if !proc::session_cgroups()
+            .iter()
+            .all(|d| d.join("memory.current").exists())
+        {
             eprintln!("skipping: no session cgroup on this machine");
             return;
         }

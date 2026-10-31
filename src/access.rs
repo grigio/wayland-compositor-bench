@@ -45,11 +45,16 @@ pub struct Issue {
 /// after the window is up, not on the activation path.
 pub fn probe(comp: Option<&proc::Compositor>) -> Vec<Issue> {
     let mut out = Vec::new();
-    let cg = proc::session_cgroup();
+    let cgs = proc::session_cgroups();
+    let paths = proc::cgroup_paths();
 
     // ------------------------------------------------------- session cgroup --
     // `exists()` is not enough: a cgroup file can be present and unreadable.
-    let readable = |name: &str| proc::read(&cg.join(name).to_string_lossy()).is_some();
+    // Every measured cgroup must be readable; a split desktop reads both.
+    let readable = |name: &str| {
+        cgs.iter()
+            .all(|cg| proc::read(&cg.join(name).to_string_lossy()).is_some())
+    };
     let has_mem = readable("memory.current");
     let has_cpu = readable("cpu.stat");
     let has_memstat = readable("memory.stat");
@@ -66,22 +71,18 @@ pub fn probe(comp: Option<&proc::Compositor>) -> Vec<Issue> {
             )
         } else if !v2 && v1 {
             (
-                format!(
-                    "cgroup v2 is not mounted; {} is a cgroup v1 path",
-                    cg.display()
-                ),
+                format!("cgroup v2 is not mounted; {paths} is a cgroup v1 path"),
                 "boot with the unified cgroup v2 hierarchy, or run inside a cgroup v2 session scope",
             )
-        } else if v2 && !cg.exists() {
+        } else if v2 && cgs.iter().any(|cg| !cg.exists()) {
             (
-                format!("cgroup v2 is mounted, but {} does not exist", cg.display()),
+                format!("cgroup v2 is mounted, but {paths} does not exist"),
                 "start the compositor from a cgroup v2 session scope, or run inside its cgroup",
             )
         } else {
             (
                 format!(
-                    "{} has no readable memory.current / memory.stat / cpu.stat / cgroup.procs",
-                    cg.display()
+                    "{paths} has no readable memory.current / memory.stat / cpu.stat / cgroup.procs"
                 ),
                 "enable the cgroup memory and cpu controllers for this session",
             )
@@ -96,10 +97,7 @@ pub fn probe(comp: Option<&proc::Compositor>) -> Vec<Issue> {
         out.push(Issue {
             kind: Kind::SessionCgroupApprox,
             metric: "session RAM/CPU",
-            detail: format!(
-                "using {} (the user slice), which also contains other sessions",
-                cg.display()
-            ),
+            detail: format!("using {paths} (the user slice), which also contains other sessions"),
             fix: "start the compositor from a session scope, or read the numbers as an upper bound",
         });
     }
@@ -170,14 +168,14 @@ pub fn probe(comp: Option<&proc::Compositor>) -> Vec<Issue> {
     // A missing cgroup already explains why PSI is missing; do not list the
     // same cause twice.
     let cgroup_missing = out.iter().any(|i| i.kind == Kind::SessionCgroup);
-    if !cgroup_missing
-        && (sysinfo::psi(cg, "cpu.pressure").is_none()
-            || sysinfo::psi(cg, "memory.pressure").is_none())
-    {
+    let has_psi = cgs.iter().all(|cg| {
+        sysinfo::psi(cg, "cpu.pressure").is_some() && sysinfo::psi(cg, "memory.pressure").is_some()
+    });
+    if !cgroup_missing && !has_psi {
         out.push(Issue {
             kind: Kind::Psi,
             metric: "pressure stalls",
-            detail: format!("{} has no cpu.pressure / memory.pressure", cg.display()),
+            detail: format!("{paths} has no cpu.pressure / memory.pressure"),
             fix: "enable CONFIG_PSI and use a cgroup v2 mount",
         });
     }

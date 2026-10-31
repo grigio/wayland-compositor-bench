@@ -10,7 +10,7 @@
 # directory.
 
 pkgname=wayland-compositor-bench
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Measure the Wayland session you are logged into: memory, cost per frame, idle power"
 arch=('x86_64')

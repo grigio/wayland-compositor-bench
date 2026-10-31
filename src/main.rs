@@ -7,6 +7,7 @@ mod proc;
 mod radar;
 mod ramchart;
 mod report;
+mod stack;
 mod sysinfo;
 mod wlscan;
 
@@ -339,7 +340,7 @@ impl SummaryUi {
         root.append(&chart.area);
 
         let hint = gtk::Label::new(Some(
-            "further out is better · pacing vs the observed cadence · compositor CPU per frame vs the frame budget · compositor RAM and CPU vs what the system has (log axes)",
+            "further out is better on every axis · the three cost axes are inverted, so a lower number lands further out · pacing vs the panel refresh · compositor CPU scaled to a common 60 Hz panel · stack RAM and CPU include the declared shell/panel (log axes)",
         ));
         hint.set_xalign(0.0);
         hint.set_wrap(true);
@@ -408,11 +409,11 @@ impl SummaryUi {
         self.radar.set(&radar::Values {
             pacing_single: s.pacing_single,
             pacing_multi: s.pacing_multi,
-            comp_ms_per_frame: s.comp_ms_per_frame_multi,
-            cadence_hz: s.cadence_hz_multi,
-            comp_pss_mib: s.comp_mib,
-            comp_cpu_pct: s.comp_cpu_pct,
-            comp_known: s.comp_mib > 0.0,
+            comp_cpu_pct_at_60hz: s.comp_cpu_pct_at_60hz,
+            render_known: s.render_known,
+            stack_pss_mib: s.stack_mib,
+            stack_cpu_pct: s.stack_cpu_pct,
+            known: s.comp_mib > 0.0,
             feat_pct: s.feat_pct,
         });
         self.chart.set(&s.cpu_series, &s.cpu_marks);
@@ -420,16 +421,27 @@ impl SummaryUi {
             .gpu_ms_per_frame
             .map(|g| format!(" · {g:.3} ms GPU"))
             .unwrap_or_default();
+        // A failed frame test is not a compositor that costs 0 %: say so here
+        // the same way the radar prints a dash instead of a centre vertex.
+        let render = if s.render_known {
+            format!(
+                "{:.2}% compositor CPU at a 60 Hz panel",
+                s.comp_cpu_pct_at_60hz
+            )
+        } else {
+            "render cost not measured".to_string()
+        };
         self.comp.set_text(&format!(
-            "session RAM {} → {} peak · session CPU {} → {} peak · {:.1}% other CPU · compositor {:.0} MiB PSS · {:.3} ms CPU/frame{} · confidence {}",
+            "session RAM {} → {} peak · session CPU {} → {} peak · {:.1}% unrelated CPU · stack {:.0} MiB / {:.2}% (core {:.0} MiB / {:.2}%) · {render}{gpu} · confidence {}",
             sysinfo::fmt_mib(s.ram_mib),
             sysinfo::fmt_mib(s.ram_peak_mib),
             sysinfo::fmt_pct(s.cpu_pct),
             sysinfo::fmt_pct(s.cpu_peak_pct),
-            s.other_cpu_pct,
+            s.unrelated_cpu_pct,
+            s.stack_mib,
+            s.stack_cpu_pct,
             s.comp_mib,
-            s.comp_ms_per_frame,
-            gpu,
+            s.comp_cpu_pct,
             s.confidence
         ));
 
@@ -533,20 +545,21 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         "  wayland display  {}",
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into())
     );
-    let cg = proc::session_cgroup();
     println!(
         "  cgroup           {} ({})",
-        cg.display(),
+        proc::cgroup_paths(),
         proc::cgroup_label()
     );
-    let cg_readable = ["memory.current", "memory.stat", "cpu.stat", "cgroup.procs"]
-        .iter()
-        .all(|f| proc::read(&cg.join(f).to_string_lossy()).is_some());
+    let cg_readable = proc::session_cgroups().iter().all(|cg| {
+        ["memory.current", "memory.stat", "cpu.stat", "cgroup.procs"]
+            .iter()
+            .all(|f| proc::read(&cg.join(f).to_string_lossy()).is_some())
+    });
     if !cg_readable {
         warn.push(format!(
             "no readable cgroup v2 counters at {}: session RAM/CPU are unavailable (cgroup v1 or \
              no session scope)",
-            cg.display()
+            proc::cgroup_paths()
         ));
     } else if !proc::cgroup_exact() {
         warn.push(
@@ -598,6 +611,29 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         None => {
             println!("  compositor       not found");
             warn.push("no compositor process: compositor CPU and memory cannot be measured".into());
+        }
+    }
+
+    if let Some(c) = &comp {
+        let (_, tree) = proc::pss_tree(c.pid);
+        let stack = stack::detect(&c.name, &tree, &opts.stack);
+        if stack.pids.is_empty() {
+            println!(
+                "  stack            {} · no separate shell/panel detected",
+                stack.style
+            );
+        } else {
+            let names: Vec<String> = stack
+                .pids
+                .iter()
+                .filter_map(|p| proc::display_name(*p))
+                .collect();
+            println!(
+                "  stack            {} · {} process(es): {}",
+                stack.style,
+                stack.pids.len(),
+                names.join(", ")
+            );
         }
     }
 
@@ -694,7 +730,7 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
     if env.throttled {
         warn.push("RAPL throttle counters are non-zero: the CPU is thermally limited".into());
     }
-    if sysinfo::psi(cg, "cpu.pressure").is_some() && sysinfo::psi(cg, "memory.pressure").is_some() {
+    if sysinfo::psi_max("cpu.pressure").is_some() && sysinfo::psi_max("memory.pressure").is_some() {
         println!("  pressure         cpu + memory PSI");
     } else {
         println!("  pressure         unavailable");
@@ -714,6 +750,16 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         "  opens {} extra toplevels for the memory and multi-surface phases",
         opts.windows
     );
+    println!(
+        "  profile {} · stack {} · target {}",
+        opts.profile.as_str(),
+        opts.stack,
+        if opts.target_hz > 0.0 {
+            format!("{:.0} Hz", opts.target_hz)
+        } else {
+            "native refresh".to_string()
+        }
+    );
     println!("  protocol scan: runs once the window is up, on its own Wayland connection");
 
     // Heavy neighbours are the most common reason two runs of the same
@@ -722,6 +768,9 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
     if let Some(c) = &comp {
         mine.push(c.pid);
         let (_, tree) = proc::pss_tree(c.pid);
+        // A declared shell/panel is part of the desktop, not a contaminant.
+        let stack = stack::detect(&c.name, &tree, &opts.stack);
+        mine.extend(stack.pids);
         mine.extend(tree);
     }
     let mut heavy: Vec<(String, f64)> = Vec::new();
@@ -792,7 +841,7 @@ fn main() -> glib::ExitCode {
         };
     }
     if let Some((a, b)) = &opts.compare {
-        return match report::compare(a, b, &opts.files) {
+        return match report::compare(a, b, &opts.files, opts.strict) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("wayland-compositor-bench: {e}");
@@ -1107,7 +1156,13 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     // ------------------------------------------------------------- wiring --
     let scan_cell: Rc<RefCell<Option<wlscan::Scan>>> = Rc::new(RefCell::new(None));
     let blur_state = Rc::new(Cell::new(wlscan::BlurState::Error));
-    let blur_off = Rc::new(Cell::new(false));
+    // Reference runs start with blur off. The chip remains a toggle, and the
+    // actual state is written to the JSON, so a reference run with blur turned
+    // back on is visible rather than silently mislabelled.
+    let blur_off = Rc::new(Cell::new(opts.profile == cli::Profile::Reference));
+    if blur_off.get() {
+        window.add_css_class("solid");
+    }
     // Clicking the chip makes the window opaque: the CSS class drops the
     // backdrop-filter, so GTK stops asking the compositor to blur behind it.
     {
@@ -1371,7 +1426,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
         set(
             labels,
             "Peak memory (since login)",
-            &sysinfo::fmt_mib(proc::memory_peak_mib(proc::session_cgroup())),
+            &sysinfo::fmt_mib(proc::session_memory_peak_mib()),
         );
         if let Some(p) = comp_pid {
             set(
@@ -1388,9 +1443,8 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
                 );
             }
         }
-        let cg = proc::session_cgroup();
-        let ps = sysinfo::psi(cg, "cpu.pressure").unwrap_or((0.0, 0.0));
-        let pm = sysinfo::psi(cg, "memory.pressure").unwrap_or((0.0, 0.0));
+        let ps = sysinfo::psi_max("cpu.pressure").unwrap_or((0.0, 0.0));
+        let pm = sysinfo::psi_max("memory.pressure").unwrap_or((0.0, 0.0));
         set(
             labels,
             "Pressure (cpu/mem)",
@@ -1405,8 +1459,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     update(&labels_c, &monitor_c);
     // Seed with the live counter, not zero: the first tick must not report the
     // cumulative time since boot as one second of CPU.
-    let cg_t = proc::session_cgroup();
-    let cpu_state = Cell::new((std::time::Instant::now(), proc::cpu_usage_usec(cg_t)));
+    let cpu_state = Cell::new((std::time::Instant::now(), proc::session_cpu_usec()));
     let labels_t = labels.clone();
     let perf_tip_t = perf_tip.clone();
     let comp_t = comp_pid;
@@ -1418,7 +1471,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
         // Re-baseline on the way out, or the first tick after the run would
         // present the run's average as one second of idle session.
         if busy_t.get() {
-            cpu_state.set((std::time::Instant::now(), proc::cpu_usage_usec(cg_t)));
+            cpu_state.set((std::time::Instant::now(), proc::session_cpu_usec()));
             return glib::ControlFlow::Continue;
         }
         let n = tick.get().wrapping_add(1);
@@ -1442,7 +1495,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             set(
                 &labels_t,
                 "Peak memory (since login)",
-                &sysinfo::fmt_mib(proc::memory_peak_mib(cg_t)),
+                &sysinfo::fmt_mib(proc::session_memory_peak_mib()),
             );
             if let Some(p) = comp_t {
                 set(
@@ -1459,8 +1512,8 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
                     );
                 }
             }
-            let ps = sysinfo::psi(cg_t, "cpu.pressure").unwrap_or((0.0, 0.0));
-            let pm = sysinfo::psi(cg_t, "memory.pressure").unwrap_or((0.0, 0.0));
+            let ps = sysinfo::psi_max("cpu.pressure").unwrap_or((0.0, 0.0));
+            let pm = sysinfo::psi_max("memory.pressure").unwrap_or((0.0, 0.0));
             set(
                 &labels_t,
                 "Pressure (cpu/mem)",
@@ -1551,12 +1604,14 @@ fn cpu_detail() -> String {
     s
 }
 
-/// Radar ceiling: this machine's total RAM, so the memory vertex shows a share
-/// of what the system has instead of an arbitrary constant. The CPU axis is
-/// relative to one core, which is the unit every CPU figure in the UI uses.
+/// Radar memory reference. The old axis was scaled to the machine's total RAM,
+/// which made the same 400 MiB stack look better on a 64 GiB workstation than
+/// on a 16 GiB laptop. A fixed 8 GiB reference keeps the vertex about the
+/// session, not about the hardware; the absolute MiB is printed at the vertex.
 fn radar_limits() -> radar::Limits {
-    let (total_ram_mib, _) = sysinfo::total_ram_mib();
-    radar::Limits { total_ram_mib }
+    radar::Limits {
+        ram_reference_mib: 8192.0,
+    }
 }
 
 /// `labwc:wlroots` reads better as `labwc · wlroots` in a dense info column.

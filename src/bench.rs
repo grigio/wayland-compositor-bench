@@ -16,7 +16,7 @@
 //!   fixed number of seconds.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,7 @@ use crate::cli::Options;
 use crate::power;
 use crate::proc;
 use crate::report;
+use crate::stack;
 use crate::sysinfo::{self, Snapshot};
 use crate::wlscan;
 
@@ -47,7 +48,7 @@ const PEAK_PERIOD_MS: u64 = 25;
 const QUIET_WINDOW_S: f64 = 2.0;
 
 pub struct Summary {
-    /// share of frames delivered at the observed cadence, one surface
+    /// delivered frames as a share of the panel refresh, one surface
     pub pacing_single: f64,
     /// the same with the extra toplevels open
     pub pacing_multi: f64,
@@ -56,15 +57,18 @@ pub struct Summary {
     pub cpu_pct: f64,
     /// compositor CPU at rest, % of one core
     pub comp_cpu_pct: f64,
+    /// compositor plus declared shell/panel CPU at rest, % of one core
+    pub stack_cpu_pct: f64,
     pub cpu_peak_pct: f64,
-    /// session CPU outside the compositor process tree and this benchmark
-    pub other_cpu_pct: f64,
+    /// session CPU outside the declared stack and this benchmark
+    pub unrelated_cpu_pct: f64,
     pub comp_mib: f64,
-    pub comp_ms_per_frame: f64,
-    /// compositor CPU per frame in the load case (multi, else single)
-    pub comp_ms_per_frame_multi: f64,
-    /// cadence that test settled into: its period is the frame budget
-    pub cadence_hz_multi: f64,
+    /// compositor plus declared shell/panel PSS
+    pub stack_mib: f64,
+    /// the load-case CPU scaled to a common 60 Hz panel
+    pub comp_cpu_pct_at_60hz: f64,
+    /// false when no frame test produced a pacing measurement
+    pub render_known: bool,
     pub gpu_ms_per_frame: Option<f64>,
     pub feat_pct: f64,
     pub feat_supported: usize,
@@ -290,30 +294,32 @@ impl Sampler {
             series.clone(),
         );
         let join = std::thread::spawn(move || {
-            let dir = proc::session_cgroup();
-            let stat_path = dir.join("memory.stat");
+            let dirs = proc::session_cgroups();
             if let Ok(mut se) = se.lock() {
-                se.reset_at(Instant::now(), proc::cpu_usage_usec(dir));
+                se.reset_at(Instant::now(), proc::session_cpu_usec());
             }
             while !s.load(Ordering::Relaxed) {
                 // Peak *working set*, not `memory.current`: the latter is mostly
                 // page cache, which moves with whatever else the session reads.
-                if let Ok(text) = std::fs::read_to_string(&stat_path) {
-                    let mut ws = 0u64;
-                    for line in text.lines() {
-                        let mut it = line.split_whitespace();
-                        let (Some(k), Some(v)) = (it.next(), it.next()) else {
-                            continue;
-                        };
-                        if k == "anon" || k == "shmem" {
-                            ws += v.parse::<u64>().unwrap_or(0);
+                // Sum over both halves of a split desktop.
+                let mut ws = 0u64;
+                for dir in dirs {
+                    if let Ok(text) = std::fs::read_to_string(dir.join("memory.stat")) {
+                        for line in text.lines() {
+                            let mut it = line.split_whitespace();
+                            let (Some(k), Some(v)) = (it.next(), it.next()) else {
+                                continue;
+                            };
+                            if k == "anon" || k == "shmem" {
+                                ws += v.parse::<u64>().unwrap_or(0);
+                            }
                         }
                     }
-                    if ws > 0 {
-                        m.fetch_max(ws, Ordering::Relaxed);
-                    }
                 }
-                let cpu = proc::cpu_usage_usec(dir);
+                if ws > 0 {
+                    m.fetch_max(ws, Ordering::Relaxed);
+                }
+                let cpu = proc::session_cpu_usec();
                 let now = Instant::now();
                 let Ok(mut se) = se.lock() else {
                     break;
@@ -355,7 +361,7 @@ impl Sampler {
         self.peak_mem.store(0, Ordering::Relaxed);
         self.peak_cpu.store(0, Ordering::Relaxed);
         let now = Instant::now();
-        let cpu = proc::cpu_usage_usec(proc::session_cgroup());
+        let cpu = proc::session_cpu_usec();
         if let Ok(mut se) = self.series.lock() {
             se.reset_at(now, cpu);
         }
@@ -414,7 +420,7 @@ impl Probe {
         let comp_ns = tasks.iter().map(|t| t.ns).sum();
         let gpu = pid.map(proc::gpu).unwrap_or_default();
         let app_gpu = proc::gpu(std::process::id());
-        let session_usec = proc::cpu_usage_usec(proc::session_cgroup());
+        let session_usec = proc::session_cpu_usec();
         let app_ns = proc::cpu_ns(std::process::id());
         Self {
             comp_ns,
@@ -430,7 +436,7 @@ impl Probe {
     /// After the measured window: counters and timestamp first, then the
     /// scans, so the probe does not charge its own work to the session.
     fn after(pid: Option<u32>) -> Self {
-        let session_usec = proc::cpu_usage_usec(proc::session_cgroup());
+        let session_usec = proc::session_cpu_usec();
         let app_ns = proc::cpu_ns(std::process::id());
         let at = Instant::now();
         let tasks = pid.map(proc::tasks).unwrap_or_default();
@@ -486,6 +492,10 @@ fn thread_shares(
 struct FrameStats {
     /// keyed by frame counter: frame_time, presentation_time, refresh_interval
     frames: BTreeMap<i64, (i64, i64, i64)>,
+    /// frame counters this client actually drew. A throttled run still receives
+    /// frame-clock ticks it skips; those frames were composed by the session but
+    /// not requested by this client, so they must not count as delivered work.
+    drawn: BTreeSet<i64>,
 }
 
 fn collect(clock: &gtk::gdk::FrameClock, st: &mut FrameStats, min_frame_time: i64) {
@@ -519,6 +529,11 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 struct Pacing {
     frames: usize,
     dropped: i64,
+    /// frames missed against the panel period, unlike `dropped` which is
+    /// measured against the rate the compositor settled into
+    dropped_vs_panel: i64,
+    pacing_vs_panel: f64,
+    p95_over_panel: f64,
     fps: f64,
     p50: f64,
     p95: f64,
@@ -592,10 +607,21 @@ fn pacing(v: &[(i64, i64, i64)], fallback_hz: f64) -> Option<Pacing> {
         .iter()
         .map(|d| ((d / cadence).round() as i64 - 1).max(0))
         .sum();
+    // The cross-compositor numbers use the panel, not the observed cadence:
+    // a deliberate 60 fps on a 120 Hz panel is half the panel, not perfect.
+    let dropped_vs_panel = deltas
+        .iter()
+        .map(|d| ((d / advertised_period).round() as i64 - 1).max(0))
+        .sum();
+    let pacing_vs_panel = (fps / advertised).clamp(0.0, 1.0);
+    let p95_over_panel = p95 / advertised_period;
 
     Some(Pacing {
         frames: times.len(),
         dropped,
+        dropped_vs_panel,
+        pacing_vs_panel,
+        p95_over_panel,
         fps,
         p50,
         p95,
@@ -604,6 +630,24 @@ fn pacing(v: &[(i64, i64, i64)], fallback_hz: f64) -> Option<Pacing> {
         cadence_hz,
         source,
     })
+}
+
+/// Compositor CPU normalized to a 60 Hz panel.
+///
+/// Cost follows the vblank rate more than the client's frame rate: throttling a
+/// client to 60 fps on a 120 Hz panel can leave the compositor doing the same
+/// per-refresh work, so `comp ms/frame × 60` would report twice the cost it
+/// would have on a 60 Hz panel. Scaling the *measured* CPU by `60 / panel_hz`
+/// compares panels rather than client targets; the client target is recorded
+/// separately as `workload_hz`.
+fn cpu_at_60hz(load_pct: f64, panel_hz: f64) -> f64 {
+    if panel_hz > 1.0 {
+        load_pct * 60.0 / panel_hz
+    } else {
+        // A refresh we could not read: leave the measured CPU alone rather
+        // than invent a scale factor.
+        load_pct
+    }
 }
 
 /// Extra toplevel that repaints every frame, so compositing costs more than one
@@ -694,6 +738,7 @@ fn cpu_attribution(
     after: &proc::CpuSnapshot,
     seconds: f64,
     exclude: &[u32],
+    ignore_top: &[u32],
 ) -> (f64, Vec<(String, f64)>) {
     if seconds <= 0.0 {
         return (0.0, Vec::new());
@@ -715,7 +760,7 @@ fn cpu_attribution(
         let pct = delta as f64 / 1e9 / seconds * 100.0;
         if exclude.contains(pid) {
             excluded_pct += pct;
-        } else if pct > 0.05 {
+        } else if pct > 0.05 && !ignore_top.contains(pid) {
             top.push((name.clone(), pct));
         }
     }
@@ -732,7 +777,7 @@ async fn settle(ui: &BenchUi, max_s: f64) -> Settle {
     let mut windows: Vec<f64> = Vec::new();
     loop {
         let t0 = Instant::now();
-        let c0 = proc::cpu_usage_usec(proc::session_cgroup());
+        let c0 = proc::session_cpu_usec();
         ui.set_status(&format!(
             "waiting for the session to settle ({:.0} s, max {:.0} s)…",
             start.elapsed().as_secs_f64(),
@@ -740,7 +785,7 @@ async fn settle(ui: &BenchUi, max_s: f64) -> Settle {
         ));
         glib::timeout_future(Duration::from_secs_f64(QUIET_WINDOW_S)).await;
         let dt = t0.elapsed().as_secs_f64();
-        let c1 = proc::cpu_usage_usec(proc::session_cgroup());
+        let c1 = proc::session_cpu_usec();
         windows.push((c1.saturating_sub(c0)) as f64 / 1e6 / dt * 100.0);
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -775,12 +820,9 @@ async fn run(ui: BenchUi) {
     ui.busy.set(true);
 
     // Anything big already running makes every number incomparable. The
-    // compositor's own process tree is part of the session on purpose.
-    let mut exclude: Vec<u32> = vec![std::process::id()];
-    if let Some(p) = pid {
-        exclude.extend(proc::pss_tree(p).1);
-    }
-    let contaminants = sysinfo::contaminants(&exclude);
+    // compositor's own process tree is part of the session on purpose; a
+    // declared shell/panel is part of the desktop too, not a contaminant. The
+    // scan runs after the settle phase, once late panels and portals exist.
 
     // ---------------------------------------------------------- context ---
     let hint = sysinfo::DisplayHint {
@@ -799,7 +841,7 @@ async fn run(ui: BenchUi) {
         report::Check {
             name: "session cgroup".into(),
             ok: proc::cgroup_exact(),
-            detail: proc::session_cgroup().display().to_string(),
+            detail: proc::cgroup_paths(),
         },
         report::Check {
             name: "compositor process".into(),
@@ -852,27 +894,42 @@ async fn run(ui: BenchUi) {
                 .map(|(_, s)| s.clone())
                 .unwrap_or_else(|| "no battery".into()),
         },
-        report::Check {
-            name: "clean session".into(),
-            ok: contaminants.is_empty(),
-            detail: if contaminants.is_empty() {
-                format!("nothing over {} MiB", sysinfo::CONTAMINANT_MIB as u32)
-            } else {
-                contaminants
-                    .iter()
-                    .take(3)
-                    .map(|(n, m)| format!("{n} {m:.0} MiB"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
-        },
     ];
+
+    // The compositor's process tree is part of the measurement, not noise; the
+    // benchmark itself is never a contaminant either.
+    let mut core_exclude: Vec<u32> = vec![std::process::id()];
+    if let Some(p) = pid {
+        core_exclude.extend(proc::pss_tree(p).1);
+    }
 
     let sampler = Sampler::start();
 
     // ------------------------------------------------------------- idle ---
     let settle = settle(&ui, opts.settle_s).await;
     let settle_s = settle.seconds;
+    // Detect after settling: a panel or portal may have started while the
+    // session was quieting down. The before/after samples use the same set.
+    let stack_sel = stack::detect(&comp_name, &core_exclude, &opts.stack);
+    // The same set keeps a late Noctalia or portal out of the contaminant list.
+    let mut contaminant_exclude = core_exclude.clone();
+    contaminant_exclude.extend(stack_sel.pids.iter().copied());
+    let contaminants = sysinfo::contaminants(&contaminant_exclude);
+    checks.push(report::Check {
+        name: "clean session".into(),
+        ok: contaminants.is_empty(),
+        detail: if contaminants.is_empty() {
+            format!("nothing over {} MiB", sysinfo::CONTAMINANT_MIB as u32)
+        } else {
+            contaminants
+                .iter()
+                .take(3)
+                .map(|(n, m)| format!("{n} {m:.0} MiB"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    });
+    let stack_before = stack::sample(&stack_sel);
     sampler.reset();
     sampler.mark("idle");
     ui.set_status(&format!(
@@ -894,11 +951,23 @@ async fn run(ui: BenchUi) {
         .as_secs_f64()
         .max(1e-6);
     let (cpu_pct, comp_pct) = i0.delta_cpu(&i1, idle_s);
-    // The offenders and the headline number come from the same idle window and
-    // the same exclusion set: compositor process tree plus this benchmark.
-    let (other_cpu_pct, top_cpu) =
-        cpu_attribution(&i0.cpu_snapshot(), &i1.cpu_snapshot(), idle_s, &exclude);
+    let stack_after = stack::sample(&stack_sel);
+    let stack_delta = stack::delta(&stack_before, &stack_after, idle_s);
+    // The offenders and the headline number come from the same idle window.
+    // `other_cpu_pct` keeps its v3 meaning: everything outside the compositor
+    // tree and this tool, including a separate shell. `unrelated_cpu_pct`
+    // subtracts the declared stack, which is what the quiet-session check uses.
+    let (other_cpu_pct, top_cpu) = cpu_attribution(
+        &i0.cpu_snapshot(),
+        &i1.cpu_snapshot(),
+        idle_s,
+        &core_exclude,
+        &stack_sel.pids,
+    );
+    let stack_cpu_pct = comp_pct + stack_delta.cpu_pct;
+    let unrelated_cpu_pct = (other_cpu_pct - stack_delta.cpu_pct).max(0.0);
     let wakeups = i1.comp_wakeups.saturating_sub(i0.comp_wakeups) as f64 / idle_s;
+    let stack_wakeups = wakeups + stack_delta.wakeups_per_s;
     let (psys_w, pkg_w) = power::delta(pw0, pw1);
     let batt_status = batt
         .as_ref()
@@ -919,15 +988,28 @@ async fn run(ui: BenchUi) {
         .join(", ");
     checks.push(report::Check {
         name: "quiet cpu".into(),
-        ok: other_cpu_pct <= 5.0,
+        ok: unrelated_cpu_pct <= 5.0,
         detail: if top_cpu.is_empty() {
-            format!("{other_cpu_pct:.1}% outside the compositor tree and this tool")
+            format!("{unrelated_cpu_pct:.1}% outside the declared stack and this tool")
         } else {
-            format!("{other_cpu_pct:.1}% outside the compositor tree and this tool: {top_cpu}")
+            format!("{unrelated_cpu_pct:.1}% outside the declared stack and this tool: {top_cpu}")
         },
     });
 
     let comp_mib = i1.comp_pss_mib;
+    let stack_mib = comp_mib + stack_delta.pss_mib;
+    let self_pss_mib = proc::pss_tree(std::process::id()).0 as f64 / 1024.0;
+    let mem_excl_self_mib = (i1.working_set_mib() - self_pss_mib).max(0.0);
+    let stack_processes: Vec<report::StackProcess> = stack_delta
+        .processes
+        .iter()
+        .map(|p| report::StackProcess {
+            pid: p.pid,
+            name: p.name.clone(),
+            pss_mib: (p.pss_mib * 10.0).round() / 10.0,
+            cpu_pct: (p.cpu_pct * 100.0).round() / 100.0,
+        })
+        .collect();
     ui.section("idle session");
     ui.add(
         "compositor",
@@ -952,16 +1034,43 @@ async fn run(ui: BenchUi) {
     );
     ui.add("  processes", &i1.procs.to_string());
     ui.add("session CPU", &format!("{cpu_pct:.2} % of one core"));
-    ui.add("compositor CPU", &format!("{comp_pct:.2} % of one core"));
     ui.add(
-        "other CPU",
-        &format!("{other_cpu_pct:.2} % of one core (neither compositor nor this tool)"),
+        "compositor CPU (core)",
+        &format!("{comp_pct:.2} % of one core"),
+    );
+    ui.add(
+        "stack CPU",
+        &format!(
+            "{stack_cpu_pct:.2} % of one core ({} · {} separate process(es))",
+            stack_sel.style,
+            stack_processes.len()
+        ),
+    );
+    ui.add(
+        "unrelated CPU",
+        &format!("{unrelated_cpu_pct:.2} % of one core (outside the stack and this tool)"),
     );
     if !top_cpu.is_empty() {
-        ui.add("  top CPU users", &top_cpu);
+        ui.add("  top unrelated CPU users", &top_cpu);
     }
     ui.add("compositor wakeups", &format!("{wakeups:.0} /s"));
-    ui.add("compositor PSS", &format!("{:.0} MiB", comp_mib));
+    ui.add("stack wakeups", &format!("{stack_wakeups:.0} /s"));
+    ui.add("compositor PSS (core)", &format!("{:.0} MiB", comp_mib));
+    ui.add("stack PSS", &format!("{:.0} MiB", stack_mib));
+    if !stack_processes.is_empty() {
+        ui.add(
+            "  stack processes",
+            &stack_processes
+                .iter()
+                .map(|p| format!("{} {:.0} MiB / {:.2} %", p.name, p.pss_mib, p.cpu_pct))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    ui.add(
+        "benchmark client PSS",
+        &format!("{self_pss_mib:.0} MiB · session without it {mem_excl_self_mib:.0} MiB"),
+    );
     ui.add(
         "platform / package power",
         &match (psys_w, pkg_w) {
@@ -1160,12 +1269,13 @@ async fn run(ui: BenchUi) {
     // nothing" are different claims.
     let features = scan_ok.then(|| report::Features::from_scan(&feats));
 
-    // Delivered frames are counted against the cadence the compositor actually
-    // settled into, so a clean 60 fps on a 120 Hz panel is 100 %, not 50 %.
+    // Delivered frames are counted against the panel refresh: a clean 60 fps
+    // on a 120 Hz panel is 50 %, not 100 %. That is the number two compositors
+    // with different shells can actually be compared on.
     let pacing_share = |r: &Option<report::RenderPhase>| {
         r.as_ref()
-            .filter(|p| p.frames > 0)
-            .map(|p| ((p.frames - p.dropped) as f64 / p.frames as f64).clamp(0.0, 1.0))
+            .and_then(|p| p.pacing_vs_panel)
+            .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(0.0)
     };
     let pacing_single = pacing_share(&single);
@@ -1181,12 +1291,13 @@ async fn run(ui: BenchUi) {
         ram_peak_mib: ram_peak,
         cpu_pct,
         comp_cpu_pct: comp_pct,
+        stack_cpu_pct,
         cpu_peak_pct: peak_cpu,
-        other_cpu_pct,
+        unrelated_cpu_pct,
         comp_mib,
-        comp_ms_per_frame: single.as_ref().map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
-        comp_ms_per_frame_multi: load.map(|r| r.comp_ms_per_frame).unwrap_or(0.0),
-        cadence_hz_multi: load.map(|r| r.cadence_hz).unwrap_or(0.0),
+        stack_mib,
+        comp_cpu_pct_at_60hz: load.and_then(|r| r.comp_cpu_pct_at_60hz).unwrap_or(0.0),
+        render_known: load.is_some(),
         gpu_ms_per_frame: single.as_ref().and_then(|r| r.gpu_ms_per_frame),
         feat_pct: feats.percent(),
         feat_supported: feats.supported,
@@ -1217,8 +1328,11 @@ async fn run(ui: BenchUi) {
             when: report::now_iso(),
             desktop: desktop.name.clone(),
             desktop_env: desktop.env.clone(),
-            cgroup: proc::session_cgroup().display().to_string(),
+            cgroup: proc::cgroup_paths(),
             cgroup_exact: proc::cgroup_exact(),
+            cgroup_kind: proc::cgroup_kind().into(),
+            stack_style: stack_sel.style.into(),
+            profile: opts.profile.as_str().into(),
             blur: if ui.blur_off.get() { "off" } else { "on" }.into(),
             confidence: confidence.to_string(),
             checks,
@@ -1248,9 +1362,18 @@ async fn run(ui: BenchUi) {
                 procs: i1.procs,
                 cpu_pct,
                 comp_cpu_pct: comp_pct,
+                stack_cpu_pct: Some(stack_cpu_pct),
+                unrelated_cpu_pct: Some(unrelated_cpu_pct),
                 other_cpu_pct: Some(other_cpu_pct),
                 wakeups_per_s: wakeups,
                 comp_pss_mib: comp_mib,
+                stack_pss_mib: Some(stack_mib),
+                stack_style: stack_sel.style.into(),
+                stack_declared: stack_sel.declared.clone(),
+                stack_processes,
+                stack_wakeups_per_s: Some(stack_wakeups),
+                self_pss_mib: Some(self_pss_mib),
+                mem_excl_self_mib: Some(mem_excl_self_mib),
                 psys_w,
                 pkg_w,
                 batt_w,
@@ -1371,9 +1494,45 @@ async fn frame_test(
         .frame_clock()
         .map(|c| c.frame_time())
         .unwrap_or(i64::MAX);
+    let target_hz = ui.opts.target_hz;
+    let target_period_us = if target_hz > 0.0 {
+        1_000_000.0 / target_hz
+    } else {
+        0.0
+    };
+    let next_due = Cell::new(0i64);
     let ex: Vec<(gtk::DrawingArea, Rc<Cell<f64>>)> = extras.to_vec();
     let tick = ui.area.add_tick_callback(move |w, clock| {
+        let now = clock.frame_time();
+        let refresh_us = clock
+            .current_timings()
+            .map(|t| t.refresh_interval())
+            .unwrap_or(0);
+        // A reference run asks the client for a fixed rate. Skipping ticks is
+        // what makes 60 Hz on a 120 Hz panel the same workload on both sides.
+        // Drawing up to half a refresh early lets a 144 Hz panel alternate two
+        // and three ticks and still average 60, instead of settling on 48.
+        if target_period_us > 0.0 {
+            if next_due.get() == 0 {
+                next_due.set(now);
+            }
+            let early = refresh_us as f64 / 2.0;
+            if (now as f64) + early < next_due.get() as f64 {
+                // Still refresh the timings of frames already seen: their
+                // presentation_time arrives a frame or two later.
+                collect(clock, &mut s.borrow_mut(), t_start);
+                return glib::ControlFlow::Continue;
+            }
+            next_due.set(next_due.get() + target_period_us as i64);
+            if next_due.get() < now {
+                // A stall must not queue a burst of catch-up frames.
+                next_due.set(now + target_period_us as i64);
+            }
+        }
         collect(clock, &mut s.borrow_mut(), t_start);
+        if let Some(t) = clock.current_timings() {
+            s.borrow_mut().drawn.insert(t.frame_counter());
+        }
         for (area, phase) in &ex {
             phase.set(phase.get() + 0.03);
             area.queue_draw();
@@ -1394,7 +1553,14 @@ async fn frame_test(
     let wall = after.at.duration_since(before.at).as_secs_f64();
     tick.remove();
 
-    let vals: Vec<(i64, i64, i64)> = stats.borrow().frames.values().cloned().collect();
+    let vals: Vec<(i64, i64, i64)> = {
+        let st = stats.borrow();
+        st.frames
+            .iter()
+            .filter(|(counter, _)| st.drawn.contains(counter))
+            .map(|(_, v)| *v)
+            .collect()
+    };
     let Some(p) = pacing(&vals, ui.refresh_hz) else {
         ui.section(&format!("frame timing · {scenario}"));
         ui.add("result", "not enough frames collected");
@@ -1404,6 +1570,8 @@ async fn frame_test(
     let frames = p.frames.max(1) as f64;
     let comp_ns = after.comp_ns.saturating_sub(before.comp_ns);
     let comp_ms = comp_ns as f64 / 1e9 * 1000.0 / frames;
+    let comp_cpu_pct_load = comp_ns as f64 / (wall * 1e9) * 100.0;
+    let comp_cpu_pct_at_60hz = cpu_at_60hz(comp_cpu_pct_load, p.target_hz);
     let app_ms = after.app_ns.saturating_sub(before.app_ns) as f64 / 1e9 * 1000.0 / frames;
     let comp_gpu =
         proc::gpu_cost(&before.gpu, &after.gpu, wall).map(|c| c.busy_s * 1000.0 / frames);
@@ -1430,20 +1598,41 @@ async fn frame_test(
     );
     ui.add(
         "target / achieved",
-        &format!(
-            "{:.0} Hz panel · {:.1} fps ({:.0} Hz cadence)",
-            p.target_hz, p.fps, p.cadence_hz
-        ),
+        &if target_hz > 0.0 {
+            format!(
+                "{target_hz:.0} Hz client target · {:.0} Hz panel · {:.1} fps ({:.0} Hz cadence)",
+                p.target_hz, p.fps, p.cadence_hz
+            )
+        } else {
+            format!(
+                "native · {:.0} Hz panel · {:.1} fps ({:.0} Hz cadence)",
+                p.target_hz, p.fps, p.cadence_hz
+            )
+        },
     );
     ui.add(
         "interval p50 / p95 / max",
         &format!("{:.2} / {:.2} / {:.2} ms", p.p50, p.p95, p.max),
     );
     ui.add(
+        "panel pacing",
+        &format!(
+            "{:.0} % of the panel · {} frames missed against the panel period",
+            p.pacing_vs_panel * 100.0,
+            p.dropped_vs_panel
+        ),
+    );
+    ui.add(
         "dropped frames",
         &format!("{} (vs the observed cadence)", p.dropped),
     );
     ui.add("compositor CPU per frame", &format!("{comp_ms:.3} ms"));
+    ui.add(
+        "compositor CPU normalized",
+        &format!(
+            "{comp_cpu_pct_load:.2} % of one core over the test · {comp_cpu_pct_at_60hz:.2} % at a 60 Hz panel"
+        ),
+    );
     ui.add(
         "GPU time per frame",
         &match (comp_gpu, app_gpu) {
@@ -1487,7 +1676,13 @@ async fn frame_test(
         dropped: p.dropped,
         fps: p.fps,
         target_hz: p.target_hz,
+        workload_hz: (target_hz > 0.0).then_some(target_hz),
         cadence_hz: p.cadence_hz,
+        pacing_vs_panel: Some(p.pacing_vs_panel),
+        dropped_vs_panel: Some(p.dropped_vs_panel),
+        p95_over_panel: Some(p.p95_over_panel),
+        comp_cpu_pct_load: Some(comp_cpu_pct_load),
+        comp_cpu_pct_at_60hz: Some(comp_cpu_pct_at_60hz),
         p50_ms: p.p50,
         p95_ms: p.p95,
         max_ms: p.max,
@@ -1548,6 +1743,19 @@ mod tests {
     }
 
     #[test]
+    fn cpu_at_60hz_scales_by_the_panel_not_the_client_rate() {
+        // The same 120 Hz panel and the same compositor CPU read 13.5 % at
+        // 60 Hz, whether the client drew natively or was throttled to 60 fps.
+        // Scaling `comp ms/frame` instead would report 27 % for the throttled
+        // run even though its total CPU was unchanged.
+        assert!((cpu_at_60hz(27.0, 120.0) - 13.5).abs() < 1e-9);
+        assert!((cpu_at_60hz(9.9, 60.0) - 9.9).abs() < 1e-9);
+        // A refresh we could not read leaves the measured figure alone.
+        assert!((cpu_at_60hz(9.9, 0.0) - 9.9).abs() < 1e-9);
+        assert!((cpu_at_60hz(9.9, 1.0) - 9.9).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_process_that_appeared_mid_window_is_not_charged_its_lifetime() {
         let before = proc::CpuSnapshot {
             total_usec: 0,
@@ -1561,7 +1769,7 @@ mod tests {
                 (2, "new".into(), 10_000_000_000),
             ],
         };
-        let (other, top) = cpu_attribution(&before, &after, 1.0, &[]);
+        let (other, top) = cpu_attribution(&before, &after, 1.0, &[], &[]);
         assert!(top.is_empty(), "a new process has no in-window baseline");
         assert!((other - 100.0).abs() < 1e-9);
     }
@@ -1576,7 +1784,7 @@ mod tests {
             total_usec: 2_000_000,
             procs: vec![(1, "old".into(), 0), (2, "busy".into(), 2_000_000_000)],
         };
-        let (other, top) = cpu_attribution(&before, &after, 2.0, &[]);
+        let (other, top) = cpu_attribution(&before, &after, 2.0, &[], &[]);
         assert!((other - 100.0).abs() < 1e-9);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].0, "busy");
