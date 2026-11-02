@@ -1140,19 +1140,20 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<()
 
     let ctx = |name: &str, list: &[Run]| {
         let r = &list[0];
-        let hz = r
+        let _hz = r
             .env
             .display
             .refresh_hz
             .or(r.env.display.compositor_hz)
             .unwrap_or(0.0);
         println!(
-            "  {name}: {} · {}x{} @ {hz:.0} Hz · scale {:.2} · {} run(s)",
+            "  {name}: {} · {}x{} @ {:.0} Hz · scale {:.2} · {} run(s)",
             r.compositor_version
                 .clone()
                 .unwrap_or_else(|| r.compositor.clone()),
             r.env.display.logical_w,
             r.env.display.logical_h,
+            r.env.display.refresh_hz.unwrap_or(0.0),
             r.env.display.scale,
             list.len()
         );

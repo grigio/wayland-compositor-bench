@@ -660,9 +660,11 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         },
         d.outputs
     );
+    let refresh_str = d.refresh_hz.map(|hz| format!("@ {:.0} Hz", hz)).unwrap_or_default();
     println!(
-        "  physical mode    {}",
-        if d.mode.is_empty() { "?" } else { &d.mode }
+        "  physical mode    {}{}",
+        if d.mode.is_empty() { "?" } else { &d.mode },
+        &refresh_str
     );
     match d.refresh_hz {
         Some(hz) => println!("  refresh (EDID)   {hz:.2} Hz"),
@@ -1375,16 +1377,22 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             } else {
                 0.0
             };
-            set(labels, "Physical mode", &phys);
+            let phys_refresh = phys.split('x').last().and_then(|s| s.parse::<u32>().ok()).map(|h| format!(" @ {:.0} Hz", h)).unwrap_or_default();
+            set(labels, "Physical mode", &format!("{}{}", phys, phys_refresh));
             set(
                 labels,
                 "Logical size",
                 &format!("{}×{}", g.width(), g.height()),
             );
+            let refresh_suffix = if refresh > 0.0 {
+                format!(" @ {:.0} Hz", refresh)
+            } else {
+                String::new()
+            };
             set(
                 labels,
                 "Resolution",
-                &format!("{}×{} · {frac:.2}×", g.width(), g.height()),
+                &format!("{}×{}{} · {frac:.2}×", g.width(), g.height(), refresh_suffix),
             );
             set(
                 labels,
