@@ -660,7 +660,10 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
         },
         d.outputs
     );
-    let refresh_str = d.refresh_hz.map(|hz| format!("@ {:.0} Hz", hz)).unwrap_or_default();
+    let refresh_str = d
+        .refresh_hz
+        .map(|hz| format!("@ {:.0} Hz", hz))
+        .unwrap_or_default();
     println!(
         "  physical mode    {}{}",
         if d.mode.is_empty() { "?" } else { &d.mode },
@@ -1377,8 +1380,17 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             } else {
                 0.0
             };
-            let phys_refresh = phys.split('x').last().and_then(|s| s.parse::<u32>().ok()).map(|h| format!(" @ {:.0} Hz", h)).unwrap_or_default();
-            set(labels, "Physical mode", &format!("{}{}", phys, phys_refresh));
+            let phys_refresh = phys
+                .split('x')
+                .last()
+                .and_then(|s| s.parse::<u32>().ok())
+                .map(|h| format!(" @ {:.0} Hz", h))
+                .unwrap_or_default();
+            set(
+                labels,
+                "Physical mode",
+                &format!("{}{}", phys, phys_refresh),
+            );
             set(
                 labels,
                 "Logical size",
@@ -1392,7 +1404,12 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             set(
                 labels,
                 "Resolution",
-                &format!("{}×{}{} · {frac:.2}×", g.width(), g.height(), refresh_suffix),
+                &format!(
+                    "{}×{}{} · {frac:.2}×",
+                    g.width(),
+                    g.height(),
+                    refresh_suffix
+                ),
             );
             set(
                 labels,
