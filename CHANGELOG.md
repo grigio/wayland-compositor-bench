@@ -53,6 +53,14 @@ All notable changes to this project. The format follows
 - `other_cpu_pct` keeps its v3 meaning; the `quiet cpu` check and its offender
   list now use `unrelated_cpu_pct`, which excludes the declared stack.
 
+## [0.6.1] — 2026-11-02
+
+### Fixed
+
+- **Clippy.** Silence `useless_borrows_in_formatting` (drop a redundant `&` in
+  a `println!`) and `double_ended_iter_last` (use `.next_back()` on the
+  `Split` iterator when parsing the physical refresh rate).
+
 ## [0.5.0] — 2026-10-30
 
 ### Added
