@@ -667,7 +667,7 @@ fn check(opts: &cli::Options) -> glib::ExitCode {
     println!(
         "  physical mode    {}{}",
         if d.mode.is_empty() { "?" } else { &d.mode },
-        &refresh_str
+        refresh_str
     );
     match d.refresh_hz {
         Some(hz) => println!("  refresh (EDID)   {hz:.2} Hz"),
@@ -1382,7 +1382,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             };
             let phys_refresh = phys
                 .split('x')
-                .last()
+                .next_back()
                 .and_then(|s| s.parse::<u32>().ok())
                 .map(|h| format!(" @ {:.0} Hz", h))
                 .unwrap_or_default();
