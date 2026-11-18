@@ -6,6 +6,8 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-11-03
+
 ### Added
 
 - Nix/NixOS packaging: a `default.nix` derivation and a `flake.nix` with a
