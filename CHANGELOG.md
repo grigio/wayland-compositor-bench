@@ -4,6 +4,20 @@ All notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Nix/NixOS packaging: a `default.nix` derivation and a `flake.nix` with a
+  package, an app, an overlay, a `programs.wayland-compositor-bench` NixOS
+  module and a dev shell. The version is read from `Cargo.toml`.
+
+### Fixed
+
+- Mesa version detection on NixOS: the version now comes from the libraries
+  mapped by the compositor instead of a scan of `/usr/lib`, which cannot see
+  Mesa in `/nix/store` or tell multiple installed versions apart.
+
 ## [0.6.0] — 2026-10-31
 
 ### Added

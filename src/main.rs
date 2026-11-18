@@ -1286,7 +1286,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
             l.set_tooltip_text(Some(&format!("PCI {}", gpu.pci_slot)));
         }
     }
-    set(&labels, "Mesa", &sysinfo::mesa_version());
+    set(&labels, "Mesa", &sysinfo::mesa_version(comp_pid));
     set(&labels, "OS", &sysinfo::os_name());
     set(
         &labels,

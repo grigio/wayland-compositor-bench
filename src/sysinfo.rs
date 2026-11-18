@@ -763,7 +763,64 @@ pub fn gpu_info(compositor: Option<u32>) -> GpuInfo {
     }
 }
 
-pub fn mesa_version() -> String {
+/// Pull a Mesa version out of a mapped library path. Two spellings occur:
+/// the classic `libgallium-25.1.0.so` soname, and Nix store paths such as
+/// `<hash>-mesa-25.1.0/lib/libvulkan_intel.so`, where the driver loaded by
+/// GTK may not be gallium at all.
+fn mesa_version_from_path(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if let Some(rest) = name.strip_prefix("libgallium-") {
+        let v = rest.split(".so").next().unwrap_or(rest);
+        let v = v.split('-').next().unwrap_or(v);
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    for component in path.split('/') {
+        let parts: Vec<&str> = component.split('-').collect();
+        if let Some(pos) = parts.iter().position(|p| *p == "mesa") {
+            if let Some(v) = parts.get(pos + 1) {
+                if !v.is_empty() && v.as_bytes()[0].is_ascii_digit() {
+                    return Some((*v).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read the mapped library paths of one process.
+fn mapped_paths(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/maps")).ok()
+}
+
+/// Which Mesa version is actually in use.
+///
+/// On NixOS several versions can live in /nix/store at once, so scanning the
+/// usual /usr/lib directories is not just incomplete, it can be wrong. The
+/// compositor is the authoritative user: it mapped the Mesa doing the
+/// rendering for this session. Our own process is second, because `--check`
+/// and the result JSON collect system info before GTK has created a GL
+/// context. The soname scan is a last resort for other distros.
+pub fn mesa_version(compositor_pid: Option<u32>) -> String {
+    let sources = compositor_pid
+        .into_iter()
+        .chain(std::iter::once(std::process::id()));
+    for pid in sources {
+        let Some(maps) = mapped_paths(pid) else {
+            continue;
+        };
+        for line in maps.lines() {
+            let Some(path) = line.split_whitespace().nth(5) else {
+                continue;
+            };
+            if let Some(v) = mesa_version_from_path(path) {
+                return v;
+            }
+        }
+    }
+    // Fallback for a compositor with no Mesa library mapped (pure software
+    // rendering, restricted /proc): look at the installed soname as before.
     for dir in [
         "/usr/lib",
         "/usr/lib64",
@@ -773,9 +830,8 @@ pub fn mesa_version() -> String {
         let Ok(rd) = fs::read_dir(dir) else { continue };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name.strip_prefix("libgallium-") {
-                let v = rest.split(".so").next().unwrap_or(rest);
-                return v.split('-').next().unwrap_or(v).to_string();
+            if let Some(v) = mesa_version_from_path(&name) {
+                return v;
             }
         }
     }
@@ -847,7 +903,7 @@ impl Env {
             gpu: gpu.name,
             gpu_driver: gpu.driver,
             gpu_pci: gpu.pci_id,
-            mesa: mesa_version(),
+            mesa: mesa_version(compositor.map(|c| c.pid)),
             os: os_name(),
             kernel: read("/proc/sys/kernel/osrelease").unwrap_or_default(),
             display: display(hint),
@@ -973,5 +1029,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(platform.name(), "msm GPU");
+    }
+
+    #[test]
+    fn mesa_version_comes_from_the_loaded_library_path() {
+        // The classic soname and the Nix store spelling of the same idea.
+        assert_eq!(
+            mesa_version_from_path("/usr/lib/x86_64-linux-gnu/libgallium-25.1.0.so"),
+            Some("25.1.0".into())
+        );
+        assert_eq!(
+            mesa_version_from_path("/nix/store/abc123-mesa-26.3.0/lib/libvulkan_intel.so"),
+            Some("26.3.0".into())
+        );
+        assert_eq!(
+            mesa_version_from_path("/nix/store/abc-graphics-drivers/lib/libgallium-26.2.5.so"),
+            Some("26.2.5".into())
+        );
+        // An unrelated path, and a "mesa" component not followed by a version.
+        assert_eq!(
+            mesa_version_from_path("/usr/lib/libwayland-client.so.0"),
+            None
+        );
+        assert_eq!(mesa_version_from_path("/opt/mesa-demos/bin/glxinfo"), None);
     }
 }

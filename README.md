@@ -70,6 +70,42 @@ and a hicolor icon, so the tool also appears in the application menu. The Debian
 package is built on Debian 13 (GTK 4.18) so the dependency floor is honest; the
 Arch package is built by `PKGBUILD` in the repository root.
 
+### Nix / NixOS
+
+The repository ships a Nix flake, so Nix and NixOS users can run or install it
+directly:
+
+```bash
+nix run github:grigio/wayland-compositor-bench -- --check
+nix profile install github:grigio/wayland-compositor-bench
+```
+
+From a checkout, `nix build` leaves the binary at
+`./result/bin/wayland-compositor-bench`. The flake also provides an overlay and
+a NixOS module; the module is the shortest way to install the tool system-wide:
+
+```nix
+{
+  inputs.wcb.url = "github:grigio/wayland-compositor-bench";
+
+  outputs = { nixpkgs, wcb, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        wcb.nixosModules.default
+        { programs.wayland-compositor-bench.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+`programs.wayland-compositor-bench.package` overrides the package if needed. To
+use the overlay instead, add `wcb.overlays.default` to `nixpkgs.overlays` and put
+`pkgs.wayland-compositor-bench` in `environment.systemPackages`. The derivation
+(also available as `default.nix` for non-flake use) installs the same binary,
+launcher and icon as the Arch and Debian packages.
+
 ### From source
 
 To build you need Rust 1.92 or newer and GTK 4.16+ development headers
@@ -89,7 +125,8 @@ cargo build --release --locked
 ```
 
 The binary is `target/release/wayland-compositor-bench`; install it anywhere on
-your `PATH`.
+your `PATH`. With Nix, `nix develop` opens a shell with the GTK and Wayland build
+inputs already set up, so the `cargo` commands above work unchanged.
 
 ## Quick start
 
@@ -349,8 +386,9 @@ cargo build --release --locked
 ```
 
 The tests run headless. `makepkg -si` builds the Arch package from the checkout;
-`packaging/build-deb.sh` builds the Debian package on Debian 13. Issues and pull
-requests are welcome.
+`packaging/build-deb.sh` builds the Debian package on Debian 13;
+`nix flake check` builds and tests the Nix package. `nix develop` drops into a
+shell with the same dependencies. Issues and pull requests are welcome.
 
 ## Documentation
 

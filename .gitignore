@@ -3,5 +3,7 @@
 /dist
 /.cargo-home
 /pkg
+/result
+/result-*
 *.pkg.tar.zst
 *.pkg.tar.zst.sig

@@ -537,7 +537,11 @@ cost visible.
 - `Cargo.toml` is the source of truth for the version; CI checks that
   `PKGBUILD`, `Cargo.lock` and the tag agree.
 - Packaging installs `/usr/bin/wayland-compositor-bench`, a `.desktop` launcher
-  and a hicolor SVG icon.
+  and a hicolor SVG icon. Arch uses `PKGBUILD`, Debian uses
+  `packaging/build-deb.sh`, and Nix/NixOS uses `default.nix` (a `callPackage`
+  derivation that reads the version from `Cargo.toml`) plus `flake.nix`
+  (package, app, overlay, `programs.wayland-compositor-bench` NixOS module and
+  dev shell). `nix flake check` runs the build and test suite.
 
 ## Known trade-offs
 
