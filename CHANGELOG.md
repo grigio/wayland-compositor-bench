@@ -6,6 +6,8 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-11-19
+
 ### Fixed
 
 - Compositor/scope: the blur probe now recognises unknown capability bits and
