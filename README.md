@@ -170,6 +170,11 @@ one you are chasing.
   are inverted and print the raw number with a `↓` marker (lower is better);
   pacing and features carry `↑`. Hover a label for what the axis plots and which
   direction is better.
+- **Export buttons:** once a run finishes, the results card offers HTML and
+  Markdown export through a save dialog, including the run on screen even when
+  it was never written to disk.
+- **Keyboard shortcuts:** `Esc` closes the window and `Ctrl+Q` quits; the
+  undecorated window is otherwise mouse-driven.
 - **Pre-run access check:** before the first run the placeholder lists any
   metric this machine cannot provide — cgroup v1 or a missing session scope,
   unreadable RAPL, a `hidepid` `/proc`, a missing `schedstat` or PSI — with the
@@ -190,6 +195,8 @@ wayland-compositor-bench --report              # medians of saved runs
 wayland-compositor-bench --report ~/runs/labwc # a directory, files, or labels
 wayland-compositor-bench --compare labwc gnome # side by side, with a noise floor
 wayland-compositor-bench --compare labwc gnome ~/runs
+wayland-compositor-bench --export markdown > results.md   # shareable table
+wayland-compositor-bench --export html > results.html     # self-contained page
 ```
 
 With no path, `--report` reads the XDG results directory **and** `./results`, so
@@ -216,6 +223,7 @@ caveats, so a script can gate on it.
 | `--profile native\|reference` | `native` | `reference` turns blur off, targets 60 Hz and runs a 10 s frame test |
 | `--target-hz HZ` | 0 (native) | throttle the benchmark client to a fixed rate |
 | `--strict` | off | make `--compare` fail on incomparable runs |
+| `--export markdown\|csv\|html [PATH…]` | off | write a shareable report to stdout; redirect it to a file |
 
 The stack is the compositor plus the separate shell/panel/notification
 processes listed by `--stack` (Waybar, Noctalia, Quickshell, SwayNC, …). With
@@ -228,6 +236,18 @@ entirely. `none` reports the compositor core only. The JSON records the
 selector, every process it added and whether the desktop is `integrated`
 (GNOME, shell inside the compositor) or `modular` (separate panel), so a
 comparison cannot silently mix the two scopes.
+
+`--export` turns saved runs into a table you can paste or publish: Markdown for
+issues and chat, HTML as a self-contained page (no external assets), and CSV for
+spreadsheets. It reads the same paths as `--report` and writes to stdout, so
+`--export html > results.html` is all you need. Every cell is a median with its
+range when the runs spread, and `-` when a metric was not measured; the raw JSON
+is untouched.
+
+In the window, the **HTML** and **Markdown** buttons under the results export
+what you are looking at, including the run just measured — even if it was not
+saved with `--json` — plus any saved runs. A save dialog asks where to put the
+file.
 
 Environment variables: `WG_BENCH_AUTORUN=1` (same as `--run`),
 `WG_BENCH_PRINT=1` (echo result rows to stdout), `WG_BENCH_NO_SUDO=1` (never use

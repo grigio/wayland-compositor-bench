@@ -11,7 +11,7 @@
 //! - context: runs whose display, compositor version or config differ are
 //!   flagged, since no amount of statistics fixes comparing 60 Hz to 120 Hz.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -950,16 +950,25 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
     let mut warnings = Vec::new();
     for (label, list) in &runs {
         // Same label, different display or config: the median mixes them.
-        let first = &list[0].env;
-        for r in list.iter().skip(1) {
-            if let Some(d) = first.display_delta(&r.env) {
-                warnings.push(format!("{label}: runs differ ({d})"));
-                break;
+        // Check every pair: a second or third run can be the odd one out while
+        // the first two agree.
+        let mut display_diff = None;
+        let mut config_diff = false;
+        for (i, a) in list.iter().enumerate() {
+            for b in list.iter().skip(i + 1) {
+                if display_diff.is_none() {
+                    display_diff = a.env.display_delta(&b.env);
+                }
+                config_diff |= a.env.config_hash.is_some()
+                    && b.env.config_hash.is_some()
+                    && a.env.config_hash != b.env.config_hash;
             }
-            if r.env.config_hash != first.config_hash && first.config_hash.is_some() {
-                warnings.push(format!("{label}: config changed between runs"));
-                break;
-            }
+        }
+        if let Some(d) = display_diff {
+            warnings.push(format!("{label}: runs differ ({d})"));
+        }
+        if config_diff {
+            warnings.push(format!("{label}: config changed between runs"));
         }
         // Only known values can disagree; an old file that predates the field
         // is not a third kind, it is an unknown.
@@ -1115,19 +1124,305 @@ pub fn print(targets: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- export ---
+
+/// One row of an exported report. Every cell is already formatted: the median
+/// with its range when the runs spread, and `-` when the metric is missing.
+struct ExportRow {
+    label: String,
+    runs: usize,
+    compositor: String,
+    version: String,
+    display: String,
+    profile: String,
+    blur: String,
+    stack: String,
+    ram: String,
+    comp_ms: String,
+    cpu60: String,
+    panel: String,
+    idle_cpu: String,
+    power: String,
+    confidence: String,
+}
+
+fn export_row(label: &str, list: &[Run]) -> ExportRow {
+    let refs: Vec<&Run> = list.iter().collect();
+    let med = |phase: &Phase, field: &str, nd: usize| {
+        field_stats(&refs, phase, field)
+            .map(|s| fmt_value(&s, nd))
+            .unwrap_or_else(|| "-".into())
+    };
+    // psys is the whole-SoC battery proxy; fall back to the battery gauge on
+    // machines without readable RAPL.
+    let power = field_stats(&refs, &IDLE, "psys_w")
+        .map(|s| fmt_value(&s, 2))
+        .or_else(|| field_stats(&refs, &IDLE, "batt_w").map(|s| fmt_value(&s, 2)))
+        .unwrap_or_else(|| "-".into());
+    let first = &list[0];
+    let d = &first.env.display;
+    let hz = d.refresh_hz.or(d.compositor_hz).unwrap_or(0.0);
+    let display = if d.logical_w > 0 && d.logical_h > 0 {
+        format!(
+            "{}×{} @ {:.0} Hz · {:.2}×",
+            d.logical_w, d.logical_h, hz, d.scale
+        )
+    } else {
+        "-".into()
+    };
+    ExportRow {
+        label: label.to_string(),
+        runs: list.len(),
+        compositor: crate::proc::compositor_impl(&first.compositor).to_string(),
+        version: first
+            .compositor_version
+            .as_deref()
+            .and_then(crate::proc::version_token)
+            .or_else(|| first.compositor_version.clone())
+            .unwrap_or_default(),
+        display,
+        profile: if first.profile.is_empty() {
+            "-".into()
+        } else {
+            first.profile.clone()
+        },
+        blur: if first.blur.is_empty() {
+            "-".into()
+        } else {
+            first.blur.clone()
+        },
+        stack: if first.stack_style.is_empty() {
+            "-".into()
+        } else {
+            first.stack_style.clone()
+        },
+        ram: med(&IDLE, "mem_mib", 0),
+        comp_ms: med(&RENDER, "comp_ms_per_frame", 3),
+        cpu60: med(&RENDER, "comp_cpu_pct_at_60hz", 2),
+        panel: med(&RENDER, "pacing_vs_panel", 1),
+        idle_cpu: med(&IDLE, "cpu_pct", 2),
+        power,
+        confidence: first.confidence.clone(),
+    }
+}
+
+const EXPORT_COLUMNS: &[(&str, &str)] = &[
+    ("label", "Label"),
+    ("runs", "Runs"),
+    ("compositor", "Compositor"),
+    ("version", "Version"),
+    ("display", "Display"),
+    ("profile", "Profile"),
+    ("blur", "Blur"),
+    ("stack", "Stack"),
+    ("ram", "Idle RAM (MiB)"),
+    ("comp_ms", "Comp ms/frame"),
+    ("cpu60", "CPU@60Hz %"),
+    ("panel", "Panel %"),
+    ("idle_cpu", "Idle CPU %"),
+    ("power", "Power (W)"),
+    ("confidence", "Confidence"),
+];
+
+impl ExportRow {
+    fn cell(&self, key: &str) -> String {
+        match key {
+            "label" => self.label.clone(),
+            "runs" => self.runs.to_string(),
+            "compositor" => self.compositor.clone(),
+            "version" => self.version.clone(),
+            "display" => self.display.clone(),
+            "profile" => self.profile.clone(),
+            "blur" => self.blur.clone(),
+            "stack" => self.stack.clone(),
+            "ram" => self.ram.clone(),
+            "comp_ms" => self.comp_ms.clone(),
+            "cpu60" => self.cpu60.clone(),
+            "panel" => self.panel.clone(),
+            "idle_cpu" => self.idle_cpu.clone(),
+            "power" => self.power.clone(),
+            "confidence" => self.confidence.clone(),
+            _ => String::new(),
+        }
+    }
+}
+
+fn csv_cell(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+fn html_cell(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn export_csv(rows: &[ExportRow]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        &EXPORT_COLUMNS
+            .iter()
+            .map(|(key, _)| csv_cell(key))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    for row in rows {
+        out.push_str(
+            &EXPORT_COLUMNS
+                .iter()
+                .map(|(key, _)| csv_cell(&row.cell(key)))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+    }
+    out
+}
+
+fn export_markdown(rows: &[ExportRow]) -> String {
+    let mut out = format!(
+        "# Wayland compositor benchmark\n\nGenerated by wayland-compositor-bench v{} · {}\n\n",
+        env!("CARGO_PKG_VERSION"),
+        now_iso()
+    );
+    out.push_str(&format!(
+        "|{}|",
+        EXPORT_COLUMNS
+            .iter()
+            .map(|(_, title)| format!(" {title} "))
+            .collect::<Vec<_>>()
+            .join("|")
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "|{}|\n",
+        vec!["---"; EXPORT_COLUMNS.len()].join("|")
+    ));
+    for row in rows {
+        out.push_str(&format!(
+            "|{}|\n",
+            EXPORT_COLUMNS
+                .iter()
+                .map(|(key, _)| format!(" {} ", md_cell(&row.cell(key))))
+                .collect::<Vec<_>>()
+                .join("|")
+        ));
+    }
+    out.push_str(
+        "\nMedians across saved runs; a range means the runs spread. \
+         Compare medians only when display, profile, blur and stack scope agree. #wcbench\n",
+    );
+    out
+}
+
+fn export_html(rows: &[ExportRow]) -> String {
+    let mut out = String::from(
+        "<!doctype html>\n<html lang=\"en\"><meta charset=\"utf-8\">\n\
+         <title>Wayland compositor benchmark</title>\n<style>\n\
+         body{background:#0e1018;color:#fff;font:14px system-ui,sans-serif;margin:2rem}\n\
+         h1{font-size:20px} table{border-collapse:collapse;width:100%}\n\
+         th,td{padding:8px 10px;border-bottom:1px solid #ffffff1a;text-align:left;white-space:nowrap}\n\
+         th{color:#ffffff8c;font-size:11px;letter-spacing:.08em;text-transform:uppercase}\n\
+         td:nth-child(n+9){font-variant-numeric:tabular-nums}\n\
+         footer{margin-top:1rem;color:#ffffff8c;font-size:12px}\n</style>\n<h1>Wayland compositor benchmark</h1>\n<table>\n<thead><tr>\n",
+    );
+    for (_, title) in EXPORT_COLUMNS {
+        out.push_str(&format!("<th>{}</th>\n", html_cell(title)));
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for row in rows {
+        out.push_str("<tr>\n");
+        for (key, _) in EXPORT_COLUMNS {
+            out.push_str(&format!("<td>{}</td>\n", html_cell(&row.cell(key))));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str(&format!(
+        "</tbody></table>\n<footer>wayland-compositor-bench v{} · {} · medians of saved runs · #wcbench</footer>\n</html>\n",
+        env!("CARGO_PKG_VERSION"),
+        html_cell(&now_iso())
+    ));
+    out
+}
+
+/// `--export markdown|csv|html`: a shareable view of saved runs. Written to
+/// stdout so it can be redirected or piped; raw data stays in the JSON files.
+pub fn export(format: &str, targets: &[PathBuf]) -> Result<(), String> {
+    print!("{}", export_text(format, targets)?);
+    Ok(())
+}
+
+/// Same export as `export`, but returns the document instead of printing it,
+/// for the GUI's Save dialog. `extra` is the run just measured in this process:
+/// it has not necessarily been written to disk (`--json` is optional), but the
+/// user still wants to export what they are looking at.
+pub fn export_text_with_run(
+    format: &str,
+    targets: &[PathBuf],
+    extra: Option<&Run>,
+) -> Result<String, String> {
+    let mut runs = match load(targets) {
+        Ok((runs, _)) => runs,
+        Err(_) if extra.is_some() => BTreeMap::new(),
+        Err(e) => return Err(e),
+    };
+    if let Some(run) = extra {
+        let label = if run.label.is_empty() {
+            "current".to_string()
+        } else {
+            run.label.clone()
+        };
+        let identity = |r: &Run| (r.when.clone(), r.compositor.clone());
+        let entry = runs.entry(label).or_default();
+        if !entry.iter().any(|r| identity(r) == identity(run)) {
+            entry.push(run.clone());
+        }
+    }
+    if runs.is_empty() {
+        return Err("no saved runs to export".into());
+    }
+    let rows: Vec<ExportRow> = runs
+        .iter()
+        .map(|(label, list)| export_row(label, list))
+        .collect();
+    match format {
+        "csv" => Ok(export_csv(&rows)),
+        "markdown" | "md" => Ok(export_markdown(&rows)),
+        "html" => Ok(export_html(&rows)),
+        other => Err(format!("unknown export format {other}")),
+    }
+}
+
+pub fn export_text(format: &str, targets: &[PathBuf]) -> Result<String, String> {
+    export_text_with_run(format, targets, None)
+}
+
 /// `--compare A B`: medians side by side, with a noise floor so a difference
 /// smaller than the run-to-run spread is not reported as a win. With `strict`,
 /// an incomparable pair is an error instead of a warning.
 pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<(), String> {
     let (runs, _) = load(targets)?;
+    let keys: Vec<String> = runs.keys().cloned().collect();
+    // An exact label wins over substring matches: comparing `labwc` with
+    // `labwc-git` must not silently compare `labwc` against itself.
     let grab = |needle: &str| -> Vec<Run> {
-        let mut out = Vec::new();
-        for (label, list) in &runs {
-            if label.to_lowercase().contains(&needle.to_lowercase()) {
-                out.extend(list.iter().cloned());
-            }
-        }
-        out
+        let matched: Vec<&String> = match keys.iter().find(|k| k.eq_ignore_ascii_case(needle)) {
+            Some(k) => vec![k],
+            None => keys
+                .iter()
+                .filter(|k| k.to_lowercase().contains(&needle.to_lowercase()))
+                .collect(),
+        };
+        matched
+            .into_iter()
+            .flat_map(|k| runs[k].iter().cloned())
+            .collect()
     };
     let (ra, rb) = (grab(a), grab(b));
     if ra.is_empty() || rb.is_empty() {
@@ -1137,10 +1432,17 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<()
             rb.len()
         ));
     }
+    let identity = |r: &Run| (r.label.clone(), r.when.clone(), r.compositor.clone());
+    let seen: HashSet<_> = ra.iter().map(identity).collect();
+    if rb.iter().any(|r| seen.contains(&identity(r))) {
+        return Err(format!(
+            "'{a}' and '{b}' selected some of the same runs; use exact labels or separate paths"
+        ));
+    }
 
     let ctx = |name: &str, list: &[Run]| {
         let r = &list[0];
-        let _hz = r
+        let hz = r
             .env
             .display
             .refresh_hz
@@ -1153,7 +1455,7 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<()
                 .unwrap_or_else(|| r.compositor.clone()),
             r.env.display.logical_w,
             r.env.display.logical_h,
-            r.env.display.refresh_hz.unwrap_or(0.0),
+            hz,
             r.env.display.scale,
             list.len()
         );
@@ -1161,103 +1463,114 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<()
     println!("\ncomparing '{a}' vs '{b}'\n");
     ctx(a, &ra);
     ctx(b, &rb);
-    let display_differ = ra[0].env.display_delta(&rb[0].env);
-    if let Some(d) = &display_differ {
-        println!("\n! displays differ ({d}) — RAM and power are not comparable");
-    }
 
-    let mut warnings = Vec::new();
-    let ka = cgroup_kind_of(&ra[0]);
-    let kb = cgroup_kind_of(&rb[0]);
-    if !ka.is_empty() && !kb.is_empty() && ka != kb {
-        warnings.push(format!(
-            "cgroup kinds differ ({ka} vs {kb}): the two runs do not cover the same session \
-             processes"
-        ));
+    let mut warnings: Vec<String> = Vec::new();
+    let mut display_differ = false;
+    // Compare every pair, not just the first run of each label: a mixed label
+    // (different blur, display or stack in run 2) must be flagged too.
+    for x in &ra {
+        for y in &rb {
+            if let Some(d) = x.env.display_delta(&y.env) {
+                display_differ = true;
+                warnings.push(format!(
+                    "displays differ ({d}) — RAM and power are not comparable"
+                ));
+            }
+            let ka = cgroup_kind_of(x);
+            let kb = cgroup_kind_of(y);
+            if !ka.is_empty() && !kb.is_empty() && ka != kb {
+                warnings.push(format!(
+                    "cgroup kinds differ ({ka} vs {kb}): the two runs do not cover the same \
+                     session processes"
+                ));
+            }
+            let (sa, sb) = (x.stack_style.as_str(), y.stack_style.as_str());
+            if !sa.is_empty() && !sb.is_empty() && sa != sb {
+                warnings.push(format!(
+                    "stack styles differ ({sa} vs {sb}): compare core with core or stack with stack"
+                ));
+            }
+            // The style alone is not the scope: `--stack none` and `--stack auto`
+            // are both "modular" on labwc but count different processes.
+            let selector = |r: &Run| {
+                r.idle
+                    .as_ref()
+                    .map(|p| p.stack_declared.clone())
+                    .unwrap_or_default()
+            };
+            let (xa, xb) = (selector(x), selector(y));
+            if !xa.is_empty() && !xb.is_empty() && xa != xb {
+                warnings.push(format!(
+                    "stack selectors differ ({xa} vs {xb}): the two runs count different \
+                     shell/panel processes"
+                ));
+            }
+            let (pa, pb) = (x.profile.as_str(), y.profile.as_str());
+            if !pa.is_empty() && !pb.is_empty() && pa != pb {
+                warnings.push(format!(
+                    "workload profiles differ ({pa} vs {pb}): use the same --profile on both sides"
+                ));
+            }
+            if x.blur != y.blur {
+                warnings.push(format!(
+                    "blur differs ({} vs {}): the compositor is doing different work",
+                    x.blur, y.blur
+                ));
+            }
+            // `--target-hz` can differ while the profile string stays `native`,
+            // and a damage-driven compositor uses less CPU when the client asks
+            // for fewer frames. CPU@60Hz would then measure two workloads.
+            let workload = |r: &Run| {
+                r.multi
+                    .as_ref()
+                    .or(r.render.as_ref())
+                    .and_then(|p| p.workload_hz)
+            };
+            match (workload(x), workload(y)) {
+                (Some(a), Some(b)) if (a - b).abs() >= 0.5 => warnings.push(format!(
+                    "render workloads differ ({a:.0} vs {b:.0} Hz target): CPU@60Hz measures \
+                     different amounts of work"
+                )),
+                (Some(a), None) | (None, Some(a)) => warnings.push(format!(
+                    "render workloads differ (native refresh vs {a:.0} Hz target): CPU@60Hz \
+                     measures different amounts of work"
+                )),
+                _ => {}
+            }
+            let power = |r: &Run| {
+                (
+                    r.env.profile.clone(),
+                    r.env.governor.clone(),
+                    r.env.epp.clone(),
+                )
+            };
+            if power(x) != power(y) {
+                warnings.push(format!(
+                    "power settings differ ({:?}/{:?}/{:?} vs {:?}/{:?}/{:?})",
+                    power(x).0,
+                    power(x).1,
+                    power(x).2,
+                    power(y).0,
+                    power(y).1,
+                    power(y).2
+                ));
+            }
+            let pacing_source = |r: &Run| {
+                r.render
+                    .as_ref()
+                    .map(|p| p.pacing_source.clone())
+                    .unwrap_or_default()
+            };
+            let (psa, psb) = (pacing_source(x), pacing_source(y));
+            if !psa.is_empty() && !psb.is_empty() && psa != psb {
+                warnings.push(format!(
+                    "pacing source differs ({psa} vs {psb}): one side lacks presentation feedback"
+                ));
+            }
+        }
     }
-    let (sa, sb) = (ra[0].stack_style.as_str(), rb[0].stack_style.as_str());
-    if !sa.is_empty() && !sb.is_empty() && sa != sb {
-        warnings.push(format!(
-            "stack styles differ ({sa} vs {sb}): compare core with core or stack with stack"
-        ));
-    }
-    // The style alone is not the scope: `--stack none` and `--stack auto` are
-    // both "modular" on labwc but count different processes.
-    let selector = |r: &Run| {
-        r.idle
-            .as_ref()
-            .map(|p| p.stack_declared.clone())
-            .unwrap_or_default()
-    };
-    let (xa, xb) = (selector(&ra[0]), selector(&rb[0]));
-    if !xa.is_empty() && !xb.is_empty() && xa != xb {
-        warnings.push(format!(
-            "stack selectors differ ({xa} vs {xb}): the two runs count different shell/panel \
-             processes"
-        ));
-    }
-    let (pa, pb) = (ra[0].profile.as_str(), rb[0].profile.as_str());
-    if !pa.is_empty() && !pb.is_empty() && pa != pb {
-        warnings.push(format!(
-            "workload profiles differ ({pa} vs {pb}): use the same --profile on both sides"
-        ));
-    }
-    if ra[0].blur != rb[0].blur {
-        warnings.push(format!(
-            "blur differs ({} vs {}): the compositor is doing different work",
-            ra[0].blur, rb[0].blur
-        ));
-    }
-    // `--target-hz` can differ while the profile string stays `native`, and a
-    // damage-driven compositor uses less CPU when the client asks for fewer
-    // frames. CPU@60Hz would then measure two workloads, not two compositors.
-    let workload = |r: &Run| {
-        r.multi
-            .as_ref()
-            .or(r.render.as_ref())
-            .and_then(|p| p.workload_hz)
-    };
-    match (workload(&ra[0]), workload(&rb[0])) {
-        (Some(a), Some(b)) if (a - b).abs() >= 0.5 => warnings.push(format!(
-            "render workloads differ ({a:.0} vs {b:.0} Hz target): CPU@60Hz measures different \
-             amounts of work"
-        )),
-        (Some(a), None) | (None, Some(a)) => warnings.push(format!(
-            "render workloads differ (native refresh vs {a:.0} Hz target): CPU@60Hz measures \
-             different amounts of work"
-        )),
-        _ => {}
-    }
-    let power = |r: &Run| {
-        (
-            r.env.profile.clone(),
-            r.env.governor.clone(),
-            r.env.epp.clone(),
-        )
-    };
-    if power(&ra[0]) != power(&rb[0]) {
-        warnings.push(format!(
-            "power settings differ ({:?}/{:?}/{:?} vs {:?}/{:?}/{:?})",
-            power(&ra[0]).0,
-            power(&ra[0]).1,
-            power(&ra[0]).2,
-            power(&rb[0]).0,
-            power(&rb[0]).1,
-            power(&rb[0]).2
-        ));
-    }
-    let pacing_source = |r: &Run| {
-        r.render
-            .as_ref()
-            .map(|p| p.pacing_source.clone())
-            .unwrap_or_default()
-    };
-    let (psa, psb) = (pacing_source(&ra[0]), pacing_source(&rb[0]));
-    if !psa.is_empty() && !psb.is_empty() && psa != psb {
-        warnings.push(format!(
-            "pacing source differs ({psa} vs {psb}): one side lacks presentation feedback"
-        ));
-    }
+    warnings.sort();
+    warnings.dedup();
     if !warnings.is_empty() {
         println!("\n! comparability:");
         for w in &warnings {
@@ -1344,7 +1657,7 @@ pub fn compare(a: &str, b: &str, targets: &[PathBuf], strict: bool) -> Result<()
          smaller than that spread is not a result. With fewer than 3 runs per\n\
          label it says 'anecdotal' instead of inventing a winner."
     );
-    if strict && (anecdotal || display_differ.is_some() || !warnings.is_empty()) {
+    if strict && (anecdotal || display_differ || !warnings.is_empty()) {
         return Err(
             "--strict: the two sides are not comparable (fewer than three runs per label, or \
              the warnings above)"
@@ -1407,6 +1720,67 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn export_formats_include_the_live_run_and_escape_values() {
+        let r = Run {
+            label: "a|b<c>".into(),
+            confidence: "high".into(),
+            ..run("a|b<c>", 120.0, 0.05)
+        };
+        // No files on disk: the GUI still exports the run it is displaying.
+        let csv = export_text_with_run("csv", &[], Some(&r)).unwrap();
+        assert!(csv
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("\"label\",\"runs\""));
+        assert!(csv.contains("\"a|b<c>\""));
+        let md = export_text_with_run("markdown", &[], Some(&r)).unwrap();
+        assert!(md.contains("# Wayland compositor benchmark"));
+        assert!(md.contains("a\\|b<c>"));
+        let html = export_text_with_run("html", &[], Some(&r)).unwrap();
+        assert!(html.contains("<!doctype html>"));
+        assert!(html.contains("<td>a|b&lt;c&gt;</td>"));
+        assert!(export_text_with_run(
+            "csv",
+            &[PathBuf::from("/nonexistent/wcb-export-test")],
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compare_uses_exact_labels_and_refuses_overlapping_selections() {
+        let dir = std::env::temp_dir().join(format!(
+            "wcb-compare-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = ["labwc", "labwc-git"]
+            .iter()
+            .map(|label| {
+                let path = dir.join(format!("{label}.json"));
+                std::fs::write(
+                    &path,
+                    serde_json::to_string(&run(label, 100.0, 0.05)).unwrap(),
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        // Exact labels resolve to one side each, even though one is a prefix
+        // of the other.
+        assert!(compare("labwc", "labwc-git", &paths, false).is_ok());
+        // A filter that matches both sides would compare a label with itself.
+        assert!(compare("lab", "git", &paths, false).is_err());
+        assert!(compare("labwc", "labwc", &paths, false).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

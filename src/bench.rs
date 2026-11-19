@@ -63,6 +63,8 @@ pub struct Summary {
     /// session CPU outside the declared stack and this benchmark
     pub unrelated_cpu_pct: f64,
     pub comp_mib: f64,
+    /// the compositor was resolved by socket even if its PSS is unreadable
+    pub comp_resolved: bool,
     /// compositor plus declared shell/panel PSS
     pub stack_mib: f64,
     /// the load-case CPU scaled to a common 60 Hz panel
@@ -111,6 +113,8 @@ pub struct BenchUi {
     pub failed: Rc<Cell<bool>>,
     pub summary: Rc<dyn Fn(Summary)>,
     pub scan: Rc<RefCell<Option<wlscan::Scan>>>,
+    /// the last finished run, for the GUI's export buttons even without --json
+    pub last_run: Rc<RefCell<Option<report::Run>>>,
     pub opts: Options,
 }
 
@@ -137,6 +141,7 @@ impl Clone for BenchUi {
             failed: self.failed.clone(),
             summary: self.summary.clone(),
             scan: self.scan.clone(),
+            last_run: self.last_run.clone(),
             opts: self.opts.clone(),
         }
     }
@@ -151,7 +156,7 @@ impl BenchUi {
     }
 
     fn add(&self, key: &str, value: &str) {
-        if std::env::var("WG_BENCH_PRINT").is_ok() && !key.is_empty() {
+        if crate::cli::env_flag("WG_BENCH_PRINT") && !key.is_empty() {
             println!("{key}\t{value}");
         }
         let r = self.row.get();
@@ -246,19 +251,20 @@ impl Series {
 
 /// Average CPU load across the run, in % of one core.
 ///
-/// Every sample is the load measured between the previous one and its own
-/// timestamp, so it describes the interval *ending* at its timestamp. The
-/// trapezoid rule is the matching estimator: each point is the right edge of
-/// the interval before it and the left edge of the interval after it. Weighting
-/// `points[i]` by the following interval (the old code) attributed every sample
-/// to the wrong side and dropped the last real one.
+/// Every sample is the load measured between the previous reading and its own
+/// timestamp: it describes the interval *ending* at its timestamp. The matching
+/// estimator weights each later sample by the span before it. A trapezoid would
+/// split every interval between its two edge samples and give half weight to
+/// the first and last reading, which understates a spike at either end of the
+/// run. The first sample belongs to the reset→first-sample interval (before the
+/// measured timeline starts), so it is not part of the run average.
 fn mean_cpu(points: &[CpuPoint]) -> f64 {
     let mut weighted = 0.0;
     let mut total = 0.0;
     for pair in points.windows(2) {
         let dt = f64::from(pair[1].0 - pair[0].0);
         if dt > 0.0 {
-            weighted += (f64::from(pair[0].1) + f64::from(pair[1].1)) * 0.5 * dt;
+            weighted += f64::from(pair[1].1) * dt;
             total += dt;
         }
     }
@@ -774,8 +780,16 @@ fn cpu_attribution(
 /// wasteful.
 async fn settle(ui: &BenchUi, max_s: f64) -> Settle {
     let start = Instant::now();
+    if max_s <= 0.0 {
+        return Settle { seconds: 0.0 };
+    }
     let mut windows: Vec<f64> = Vec::new();
     loop {
+        let remaining = max_s - start.elapsed().as_secs_f64();
+        if remaining <= 0.0 {
+            break;
+        }
+        // Do not overshoot a short `--settle` by a whole quiet window.
         let t0 = Instant::now();
         let c0 = proc::session_cpu_usec();
         ui.set_status(&format!(
@@ -783,7 +797,7 @@ async fn settle(ui: &BenchUi, max_s: f64) -> Settle {
             start.elapsed().as_secs_f64(),
             max_s
         ));
-        glib::timeout_future(Duration::from_secs_f64(QUIET_WINDOW_S)).await;
+        glib::timeout_future(Duration::from_secs_f64(QUIET_WINDOW_S.min(remaining))).await;
         let dt = t0.elapsed().as_secs_f64();
         let c1 = proc::session_cpu_usec();
         windows.push((c1.saturating_sub(c0)) as f64 / 1e6 / dt * 100.0);
@@ -1240,6 +1254,18 @@ async fn run(ui: BenchUi) {
     ui.add("sampling", &format!("every {PEAK_PERIOD_MS} ms"));
 
     // --------------------------------------------------------- confidence --
+    // Say explicitly when the frame test produced nothing: `confidence()`
+    // treats a missing check as failed, so without this a run with no pacing
+    // data at all would still read "medium".
+    checks.push(report::Check {
+        name: "frame data".into(),
+        ok: single.is_some(),
+        detail: if single.is_some() {
+            "frame test completed".into()
+        } else {
+            "no frame test produced a pacing measurement".into()
+        },
+    });
     if let Some(r) = &single {
         checks.push(report::Check {
             name: "presentation feedback".into(),
@@ -1295,6 +1321,7 @@ async fn run(ui: BenchUi) {
         cpu_peak_pct: peak_cpu,
         unrelated_cpu_pct,
         comp_mib,
+        comp_resolved: comp.is_some(),
         stack_mib,
         comp_cpu_pct_at_60hz: load.and_then(|r| r.comp_cpu_pct_at_60hz).unwrap_or(0.0),
         render_known: load.is_some(),
@@ -1311,129 +1338,131 @@ async fn run(ui: BenchUi) {
         cpu_marks: cpu_marks.clone(),
     });
 
-    // --------------------------------------------------------------- json ---
-    if let Some(target) = &opts.json {
-        let run = report::Run {
-            schema_version: report::SCHEMA_VERSION,
-            label: opts.label(&desktop.name),
-            compositor: comp_name,
-            compositor_version: comp
-                .as_ref()
-                .and_then(|c| proc::compositor_version(&c.name)),
-            compositor_pid: pid.unwrap_or(0),
-            compositor_source: comp
-                .as_ref()
-                .map(|c| c.source.to_string())
-                .unwrap_or_default(),
-            when: report::now_iso(),
-            desktop: desktop.name.clone(),
-            desktop_env: desktop.env.clone(),
-            cgroup: proc::cgroup_paths(),
-            cgroup_exact: proc::cgroup_exact(),
-            cgroup_kind: proc::cgroup_kind().into(),
+    // ----------------------------------------------------------- run data ---
+    // Built even without --json: the GUI can export what it just displayed.
+    let run = report::Run {
+        schema_version: report::SCHEMA_VERSION,
+        label: opts.label(&desktop.name),
+        compositor: comp_name,
+        compositor_version: comp
+            .as_ref()
+            .and_then(|c| proc::compositor_version(&c.name)),
+        compositor_pid: pid.unwrap_or(0),
+        compositor_source: comp
+            .as_ref()
+            .map(|c| c.source.to_string())
+            .unwrap_or_default(),
+        when: report::now_iso(),
+        desktop: desktop.name.clone(),
+        desktop_env: desktop.env.clone(),
+        cgroup: proc::cgroup_paths(),
+        cgroup_exact: proc::cgroup_exact(),
+        cgroup_kind: proc::cgroup_kind().into(),
+        stack_style: stack_sel.style.into(),
+        profile: opts.profile.as_str().into(),
+        blur: if ui.blur_off.get() { "off" } else { "on" }.into(),
+        confidence: confidence.to_string(),
+        checks,
+        clean: contaminants.is_empty(),
+        contaminants: contaminants
+            .iter()
+            .map(|(name, pss_mib)| report::Contaminant {
+                name: name.clone(),
+                pss_mib: (pss_mib * 10.0).round() / 10.0,
+            })
+            .collect(),
+        env,
+        features,
+        idle: Some(report::IdlePhase {
+            dur_s: opts.idle_s,
+            measured_s: Some(idle_s),
+            settle_s,
+            mem_mib: i1.working_set_mib(),
+            total_mib: i1.total_mib,
+            peak_mib: idle_peak_mib,
+            peak_method: format!("polled every {PEAK_PERIOD_MS} ms"),
+            anon_mib: i1.anon_mib,
+            shmem_mib: i1.shmem_mib,
+            file_mib: i1.file_mib,
+            kernel_mib: i1.kernel_mib,
+            swap_mib: i1.swap_mib,
+            procs: i1.procs,
+            cpu_pct,
+            comp_cpu_pct: comp_pct,
+            stack_cpu_pct: Some(stack_cpu_pct),
+            unrelated_cpu_pct: Some(unrelated_cpu_pct),
+            other_cpu_pct: Some(other_cpu_pct),
+            wakeups_per_s: wakeups,
+            comp_pss_mib: comp_mib,
+            stack_pss_mib: Some(stack_mib),
             stack_style: stack_sel.style.into(),
-            profile: opts.profile.as_str().into(),
-            blur: if ui.blur_off.get() { "off" } else { "on" }.into(),
-            confidence: confidence.to_string(),
-            checks,
-            clean: contaminants.is_empty(),
-            contaminants: contaminants
-                .iter()
-                .map(|(name, pss_mib)| report::Contaminant {
-                    name: name.clone(),
-                    pss_mib: (pss_mib * 10.0).round() / 10.0,
-                })
-                .collect(),
-            env,
-            features,
-            idle: Some(report::IdlePhase {
-                dur_s: opts.idle_s,
-                measured_s: Some(idle_s),
-                settle_s,
-                mem_mib: i1.working_set_mib(),
-                total_mib: i1.total_mib,
-                peak_mib: idle_peak_mib,
-                peak_method: format!("polled every {PEAK_PERIOD_MS} ms"),
-                anon_mib: i1.anon_mib,
-                shmem_mib: i1.shmem_mib,
-                file_mib: i1.file_mib,
-                kernel_mib: i1.kernel_mib,
-                swap_mib: i1.swap_mib,
-                procs: i1.procs,
-                cpu_pct,
-                comp_cpu_pct: comp_pct,
-                stack_cpu_pct: Some(stack_cpu_pct),
-                unrelated_cpu_pct: Some(unrelated_cpu_pct),
-                other_cpu_pct: Some(other_cpu_pct),
-                wakeups_per_s: wakeups,
-                comp_pss_mib: comp_mib,
-                stack_pss_mib: Some(stack_mib),
-                stack_style: stack_sel.style.into(),
-                stack_declared: stack_sel.declared.clone(),
-                stack_processes,
-                stack_wakeups_per_s: Some(stack_wakeups),
-                self_pss_mib: Some(self_pss_mib),
-                mem_excl_self_mib: Some(mem_excl_self_mib),
-                psys_w,
-                pkg_w,
-                batt_w,
-                batt_status,
-                threads: idle_threads,
-            }),
-            windows: Some(report::WindowsPhase {
-                extra: n,
-                settle_s: WINDOW_SETTLE_MS as f64 / 1000.0,
-                method: "same-process GTK toplevels".into(),
-                baseline_mib: base.working_set_mib(),
-                baseline_drift_mib: Some(baseline_drift),
-                with_windows_mib: with_wins.working_set_mib(),
-                delta_mib: delta,
-                delta_valid,
-                client_gpu_mib: client_gpu,
-                comp_gpu_mib: comp_gpu,
-                per_window_mib: per_window,
-                comp_delta_mib: comp_delta,
-                client_delta_mib: client_delta,
-                residual_mib: residual,
-                post_close_drift_mib: Some(post_close_drift),
-            }),
-            render: single,
-            multi,
-            peaks: Some(report::PeakPhase {
-                dur_s: run_t0.elapsed().as_secs_f64(),
-                ram_before_mib: i1.working_set_mib(),
-                ram_peak_mib: ram_peak,
-                ram_peak_method: format!("polled every {PEAK_PERIOD_MS} ms"),
-                cpu_idle_pct: cpu_pct,
-                cpu_avg_pct: Some(cpu_avg),
-                cpu_peak_pct: peak_cpu,
-                cpu_series: Some(
-                    cpu_series
-                        .iter()
-                        .map(|(t_s, pct)| report::CpuPoint {
-                            t_s: *t_s,
-                            pct: *pct,
-                        })
-                        .collect(),
-                ),
-                cpu_marks: Some(
-                    cpu_marks
-                        .iter()
-                        .map(|(t_s, phase)| report::CpuMark {
-                            t_s: *t_s,
-                            phase: (*phase).to_string(),
-                        })
-                        .collect(),
-                ),
-            }),
-        };
+            stack_declared: stack_sel.declared.clone(),
+            stack_processes,
+            stack_wakeups_per_s: Some(stack_wakeups),
+            self_pss_mib: Some(self_pss_mib),
+            mem_excl_self_mib: Some(mem_excl_self_mib),
+            psys_w,
+            pkg_w,
+            batt_w,
+            batt_status,
+            threads: idle_threads,
+        }),
+        windows: Some(report::WindowsPhase {
+            extra: n,
+            settle_s: WINDOW_SETTLE_MS as f64 / 1000.0,
+            method: "same-process GTK toplevels".into(),
+            baseline_mib: base.working_set_mib(),
+            baseline_drift_mib: Some(baseline_drift),
+            with_windows_mib: with_wins.working_set_mib(),
+            delta_mib: delta,
+            delta_valid,
+            client_gpu_mib: client_gpu,
+            comp_gpu_mib: comp_gpu,
+            per_window_mib: per_window,
+            comp_delta_mib: comp_delta,
+            client_delta_mib: client_delta,
+            residual_mib: residual,
+            post_close_drift_mib: Some(post_close_drift),
+        }),
+        render: single,
+        multi,
+        peaks: Some(report::PeakPhase {
+            dur_s: run_t0.elapsed().as_secs_f64(),
+            ram_before_mib: i1.working_set_mib(),
+            ram_peak_mib: ram_peak,
+            ram_peak_method: format!("polled every {PEAK_PERIOD_MS} ms"),
+            cpu_idle_pct: cpu_pct,
+            cpu_avg_pct: Some(cpu_avg),
+            cpu_peak_pct: peak_cpu,
+            cpu_series: Some(
+                cpu_series
+                    .iter()
+                    .map(|(t_s, pct)| report::CpuPoint {
+                        t_s: *t_s,
+                        pct: *pct,
+                    })
+                    .collect(),
+            ),
+            cpu_marks: Some(
+                cpu_marks
+                    .iter()
+                    .map(|(t_s, phase)| report::CpuMark {
+                        t_s: *t_s,
+                        phase: (*phase).to_string(),
+                    })
+                    .collect(),
+            ),
+        }),
+    };
+    *ui.last_run.borrow_mut() = Some(run.clone());
+    if let Some(target) = &opts.json {
         let target_name = match target {
             crate::cli::JsonTarget::Path(p) => p.display().to_string(),
             crate::cli::JsonTarget::Auto => report::results_dir().display().to_string(),
         };
         match run.write(target) {
             Ok(path) => {
-                if std::env::var("WG_BENCH_PRINT").is_ok() {
+                if crate::cli::env_flag("WG_BENCH_PRINT") {
                     println!("{}", run.summary_line());
                 }
                 ui.add("written to", &path.display().to_string());
@@ -1714,7 +1743,7 @@ fn confidence(checks: &[report::Check]) -> &'static str {
             .map(|c| !c.ok)
             .unwrap_or(true)
     };
-    if bad("session cgroup") || bad("compositor process") {
+    if bad("session cgroup") || bad("compositor process") || bad("frame data") {
         "low"
     } else if bad("presentation feedback")
         || bad("display refresh")
@@ -1732,14 +1761,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_average_weights_each_sample_by_its_span() {
-        // 10 % of a core for the first half of the run, 100 % for the second
+    fn cpu_average_weights_each_sample_by_the_interval_it_measures() {
+        // Each sample describes the interval ending at its timestamp. The one
+        // at t=0 covers the reset window, so it is outside the run; both run
+        // intervals measured 100 %. A trapezoid would report 77.5 here.
         let pts: Vec<CpuPoint> = vec![(0.0, 10.0), (0.5, 100.0), (1.0, 100.0)];
-        // trapezoid: (10+100)/2 over 0.5 s + (100+100)/2 over 0.5 s
-        assert!((mean_cpu(&pts) - 77.5).abs() < 1e-6);
-        // a sample that never got an interval of its own is not invented
+        assert!((mean_cpu(&pts) - 100.0).abs() < 1e-6);
+        // unequal intervals get unequal weight
+        let pts: Vec<CpuPoint> = vec![(0.0, 0.0), (0.25, 100.0), (1.0, 0.0)];
+        assert!((mean_cpu(&pts) - 25.0).abs() < 1e-6);
         assert_eq!(mean_cpu(&[]), 0.0);
         assert!((mean_cpu(&[(0.0, 42.0)]) - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_missing_frame_test_is_low_confidence() {
+        let ok = |name: &str| report::Check {
+            name: name.into(),
+            ok: true,
+            detail: String::new(),
+        };
+        let base = vec![
+            ok("session cgroup"),
+            ok("compositor process"),
+            ok("display refresh"),
+            ok("clean session"),
+            ok("quiet cpu"),
+            ok("presentation feedback"),
+        ];
+        assert_eq!(
+            confidence(&base),
+            "low",
+            "a missing frame-data check fails it"
+        );
+        let mut with_data = base.clone();
+        with_data.push(ok("frame data"));
+        assert_eq!(confidence(&with_data), "high");
+        let mut failed = with_data;
+        failed.last_mut().unwrap().ok = false;
+        assert_eq!(confidence(&failed), "low");
     }
 
     #[test]

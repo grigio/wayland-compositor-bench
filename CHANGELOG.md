@@ -6,6 +6,37 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Compositor/scope: the blur probe now recognises unknown capability bits and
+  no longer blocks the UI on a compositor that never answers; CPU averages use
+  the interval each sample measures; RAPL timestamps are taken after the reads
+  and counter wrap-around no longer overflows; PSI keeps the maximum of both
+  components and skips malformed lines; stack detection only matches executable
+  names, not arbitrary words in a command line.
+- Reporting: `--compare` resolves exact labels first and refuses overlapping
+  selections; context checks now cover every run of both labels; a compositor
+  with unreadable PSS no longer plots as "unknown"; NaN never plots as the best
+  radar value.
+- Session info: the "Physical mode" row no longer prints the panel height as a
+  fake refresh rate; scale falls back to GDK's integer value consistently.
+- Env flags `WG_BENCH_AUTORUN`, `WG_BENCH_PRINT` and `WG_BENCH_NO_SUDO` now need
+  a truthy value (`=1` as documented) instead of just being present.
+- `--settle 0` no longer waits two seconds; `--json=FILE` accepts paths that
+  start with a dash; conflicting mode flags are rejected.
+
+### Added
+
+- `--export markdown|csv|html [PATH…]` turns saved runs into shareable reports.
+  The window's results card has HTML and Markdown buttons using the same
+  renderer; they include the run on screen even without `--json`.
+- Keyboard shortcuts: `Esc` closes the window and `Ctrl+Q` quits.
+- Feature coverage now lists the legacy primary-selection and data-control
+  protocols and `wp_color_manager_v1`, so wlroots-only compositors are not
+  under-scored.
+- Release CI now waits for the version, MSRV, audit and Nix checks before
+  publishing.
+
 ## [0.6.2] — 2026-11-03
 
 ### Added
@@ -19,6 +50,14 @@ All notable changes to this project. The format follows
 - Mesa version detection on NixOS: the version now comes from the libraries
   mapped by the compositor instead of a scan of `/usr/lib`, which cannot see
   Mesa in `/nix/store` or tell multiple installed versions apart.
+
+## [0.6.1] — 2026-11-02
+
+### Fixed
+
+- **Clippy.** Silence `useless_borrows_in_formatting` (drop a redundant `&` in
+  a `println!`) and `double_ended_iter_last` (use `.next_back()` on the
+  `Split` iterator when parsing the physical refresh rate).
 
 ## [0.6.0] — 2026-10-31
 
@@ -68,14 +107,6 @@ All notable changes to this project. The format follows
   blur states, power settings and presentation-feedback sources.
 - `other_cpu_pct` keeps its v3 meaning; the `quiet cpu` check and its offender
   list now use `unrelated_cpu_pct`, which excludes the declared stack.
-
-## [0.6.1] — 2026-11-02
-
-### Fixed
-
-- **Clippy.** Silence `useless_borrows_in_formatting` (drop a redundant `&` in
-  a `println!`) and `double_ended_iter_last` (use `.next_back()` on the
-  `Split` iterator when parsing the physical refresh rate).
 
 ## [0.5.0] — 2026-10-30
 

@@ -10,6 +10,7 @@ USAGE:
     wayland-compositor-bench --run [--json [FILE]]  start measuring as soon as it is up
     wayland-compositor-bench --report [PATH…]       print medians of saved runs
     wayland-compositor-bench --compare A B [PATH…]  two labels side by side, with noise floor
+    wayland-compositor-bench --export FMT [PATH…]   export saved runs as markdown|csv|html
     wayland-compositor-bench --check                can this session be measured reliably?
     wayland-compositor-bench --help
 
@@ -48,6 +49,19 @@ ENVIRONMENT:
     WG_BENCH_PRINT=1    echo every result row to stdout
     WG_BENCH_NO_SUDO=1  never use `sudo -n` for root-only RAPL counters
 ";
+
+/// `WG_BENCH_*` flags are documented as `=1`; mere presence must not enable
+/// them, or `WG_BENCH_AUTORUN=0` would still start a run.
+pub fn env_flag(name: &str) -> bool {
+    flag_value(&std::env::var(name).unwrap_or_default())
+}
+
+fn flag_value(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 /// Where the finished run goes.
 #[derive(Clone, Debug)]
@@ -90,6 +104,8 @@ pub struct Options {
     pub run: bool,
     pub json: Option<JsonTarget>,
     pub report: bool,
+    /// output format for `--export`: markdown, csv or html
+    pub export: Option<String>,
     pub check: bool,
     pub compare: Option<(String, String)>,
     /// files or directories for `--report`; empty means `results/`
@@ -112,9 +128,10 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            run: std::env::var("WG_BENCH_AUTORUN").is_ok(),
+            run: env_flag("WG_BENCH_AUTORUN"),
             json: None,
             report: false,
+            export: None,
             check: false,
             compare: None,
             files: Vec::new(),
@@ -144,6 +161,14 @@ impl Options {
             match arg.as_str() {
                 "--run" => o.run = true,
                 "--report" => o.report = true,
+                "--export" => {
+                    let v = it.next().ok_or("--export needs markdown, csv or html")?;
+                    let v = v.to_ascii_lowercase();
+                    if !matches!(v.as_str(), "markdown" | "md" | "csv" | "html") {
+                        return Err(format!("--export: expected markdown, csv or html, got {v}"));
+                    }
+                    o.export = Some(v);
+                }
                 "--check" => o.check = true,
                 "-h" | "--help" => o.help = true,
                 "-V" | "--version" => o.version = true,
@@ -160,6 +185,15 @@ impl Options {
                         }
                         _ => JsonTarget::Auto,
                     });
+                    o.run = true;
+                }
+                other if other.starts_with("--json=") => {
+                    let path = &other["--json=".len()..];
+                    if path.is_empty() {
+                        return Err("--json= needs a file name".into());
+                    }
+                    // the `=` form also accepts paths starting with a dash
+                    o.json = Some(JsonTarget::Path(PathBuf::from(path)));
                     o.run = true;
                 }
                 "--label" => o.label = Some(it.next().ok_or("--label needs a value")?),
@@ -191,7 +225,7 @@ impl Options {
                     return Err(format!("unknown option {other}"));
                 }
                 other => {
-                    if !(o.report || o.compare.is_some()) {
+                    if !(o.report || o.compare.is_some() || o.export.is_some()) {
                         return Err(format!("unexpected argument {other}"));
                     }
                     o.files.push(PathBuf::from(other));
@@ -225,6 +259,22 @@ impl Options {
         }
         if o.strict && o.compare.is_none() {
             return Err("--strict only applies to --compare".into());
+        }
+        let modes = [
+            o.report,
+            o.compare.is_some(),
+            o.export.is_some(),
+            o.check,
+            o.json.is_some(),
+        ]
+        .iter()
+        .filter(|&&on| on)
+        .count();
+        if modes > 1 {
+            return Err(
+                "only one of --report, --compare, --export, --check and --json may be used at a time"
+                    .into(),
+            );
         }
         Ok(o)
     }
@@ -288,6 +338,36 @@ mod tests {
     fn json_with_path() {
         let o = parse(&["--json", "out.json"]);
         assert!(matches!(o.json, Some(JsonTarget::Path(ref p)) if p == &PathBuf::from("out.json")));
+        // the `=` form accepts a path beginning with a dash
+        let o = parse(&["--json=-weird.json"]);
+        assert!(
+            matches!(o.json, Some(JsonTarget::Path(ref p)) if p == &PathBuf::from("-weird.json"))
+        );
+    }
+
+    #[test]
+    fn env_flags_need_a_truthy_value() {
+        assert!(flag_value("1"));
+        assert!(flag_value("TRUE"));
+        assert!(flag_value("yes"));
+        assert!(!flag_value("0"));
+        assert!(!flag_value("false"));
+        assert!(!flag_value(""));
+    }
+
+    #[test]
+    fn conflicting_modes_are_rejected() {
+        for args in [
+            vec!["--report", "--json"],
+            vec!["--compare", "a", "b", "--json"],
+            vec!["--report", "--compare", "a", "b"],
+            vec!["--export", "csv", "--report"],
+        ] {
+            assert!(
+                Options::parse(args.iter().map(|s| s.to_string())).is_err(),
+                "{args:?} must not combine modes"
+            );
+        }
     }
 
     #[test]
@@ -295,6 +375,14 @@ mod tests {
         let o = parse(&["--report", "labwc", "results/gnome-1.json"]);
         assert!(o.report);
         assert_eq!(o.files.len(), 2);
+    }
+
+    #[test]
+    fn export_takes_a_format_and_paths() {
+        let o = parse(&["--export", "markdown", "results/labwc.json"]);
+        assert_eq!(o.export.as_deref(), Some("markdown"));
+        assert_eq!(o.files.len(), 1);
+        assert!(Options::parse(["--export".to_string(), "pdf".to_string()].into_iter()).is_err());
     }
 
     #[test]

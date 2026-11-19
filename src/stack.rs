@@ -115,12 +115,11 @@ fn matches(candidate: &str, cmdline: &str, wanted: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let cmd = cmdline.to_ascii_lowercase();
-    comm == wanted
-        || argv0 == wanted
-        || comm.starts_with(&wanted)
-        || argv0.starts_with(&wanted)
-        || (wanted.len() >= 4 && cmd.contains(&wanted))
+    // Only the executable name counts. A raw substring search on the whole
+    // command line matches `mako` in a browser URL or `waybar` in a shell
+    // command, attributing an unrelated process to the desktop stack. `comm`
+    // is truncated to 15 bytes by the kernel, hence the prefix rule there.
+    comm == wanted || argv0 == wanted || comm.starts_with(&wanted) || argv0.starts_with(&wanted)
 }
 
 fn wanted_by_selector(declared: &str) -> Option<Vec<String>> {
@@ -270,6 +269,14 @@ mod tests {
         ));
         assert!(matches("waybar", "/usr/bin/waybar -c config", "waybar"));
         assert!(!matches("waybar", "/usr/bin/waybar", "noctalia"));
+        assert!(
+            !matches("firefox", "/usr/bin/firefox https://mako.dev", "mako"),
+            "an URL is not a notification daemon"
+        );
+        assert!(
+            !matches("sh", "/bin/sh -c 'killall waybar'", "waybar"),
+            "an argument mentioning a shell name is not the panel"
+        );
         assert!(
             !matches("flags", "/usr/bin/flags", "ags"),
             "short names are exact"

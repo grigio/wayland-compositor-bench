@@ -229,8 +229,9 @@ pub fn outputs() -> Vec<Output> {
 /// Refresh of a connector's preferred mode, computed from the first detailed
 /// timing descriptor in the EDID. Independent of what the compositor claims.
 fn edid_refresh(connector: &str) -> Option<f64> {
+    const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
     let b = fs::read(format!("/sys/class/drm/{connector}/edid")).ok()?;
-    if b.len() < 72 {
+    if b.len() < 72 || b[..8] != HEADER {
         return None;
     }
     let d = &b[54..72];
@@ -274,17 +275,35 @@ pub struct Backlight {
 }
 
 pub fn backlight() -> Option<Backlight> {
-    let rd = fs::read_dir("/sys/class/backlight").ok()?;
-    // Only the first entry is ever inspected: the panel backlight.
-    let e = rd.flatten().next()?;
-    let dir = e.path();
+    let mut entries: Vec<(String, std::path::PathBuf)> = fs::read_dir("/sys/class/backlight")
+        .ok()?
+        .flatten()
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .collect();
+    // readdir order is arbitrary: a keyboard backlight can sort first. Prefer a
+    // real panel, then any non-keyboard device, then a stable name.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let chosen = entries
+        .iter()
+        .find(|(name, dir)| {
+            !name.contains("kbd")
+                && proc::read(&dir.join("type").to_string_lossy()).as_deref() == Some("panel")
+        })
+        .or_else(|| entries.iter().find(|(name, _)| !name.contains("kbd")))
+        .cloned()
+        .or_else(|| entries.into_iter().next())?;
+    let (name, dir) = chosen;
     let value = proc::read_u64(&dir.join("brightness").to_string_lossy())?;
     let max = proc::read_u64(&dir.join("max_brightness").to_string_lossy()).unwrap_or(0);
-    Some(Backlight {
-        name: e.file_name().to_string_lossy().to_string(),
-        value,
-        max,
-    })
+    Some(Backlight { name, value, max })
+}
+
+/// EDID refresh of the first connected output, when a detailed timing exists.
+pub fn first_output_refresh() -> Option<f64> {
+    outputs()
+        .into_iter()
+        .find(|o| o.connected)
+        .and_then(|o| edid_refresh(&o.connector))
 }
 
 /// Current physical mode of the first connected output.
@@ -362,15 +381,27 @@ pub fn package_temp_c() -> Option<f64> {
     None
 }
 
-/// True when the kernel exposes RAPL throttle counters and any of them is set.
+/// True when the kernel exposes a RAPL throttle counter and any of them is set.
+///
+/// Domain 0 is not always the package (multi-socket, psys-first enumeration,
+/// AMD), so walk the powercap tree instead of hardcoding one path.
 pub fn throttled() -> bool {
-    let mut any = false;
-    for f in ["core_throttle", "package_throttle"] {
-        if let Some(v) = proc::read_u64(&format!("/sys/class/powercap/intel-rapl:0/{f}")) {
-            any |= v > 0;
+    fn scan(dir: &std::path::Path, depth: u32) -> bool {
+        let Ok(rd) = fs::read_dir(dir) else {
+            return false;
+        };
+        let mut any = false;
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                any |= depth > 0 && scan(&path, depth - 1);
+            } else if entry.file_name().to_string_lossy().ends_with("_throttle") {
+                any |= proc::read_u64(&path.to_string_lossy()).unwrap_or(0) > 0;
+            }
         }
+        any
     }
-    any
+    scan(std::path::Path::new("/sys/class/powercap"), 2)
 }
 
 /// The highest `(some, full)` avg10 across the measured cgroups.
@@ -381,10 +412,19 @@ pub fn throttled() -> bool {
 /// the other half, so the reported value is the maximum, a floor for the
 /// desktop rather than a sum that double-counts.
 pub fn psi_max(file: &str) -> Option<(f64, f64)> {
-    proc::session_cgroups()
-        .iter()
-        .filter_map(|cg| psi(cg, file))
-        .max_by(|a, b| a.0.total_cmp(&b.0))
+    let mut some = 0.0f64;
+    let mut full = 0.0f64;
+    let mut any = false;
+    for cg in proc::session_cgroups() {
+        if let Some((s, f)) = psi(cg, file) {
+            any = true;
+            // Each component has its own maximum: a cgroup with some=10/full=0
+            // must not hide full=9 from another cgroup.
+            some = some.max(s);
+            full = full.max(f);
+        }
+    }
+    any.then_some((some, full))
 }
 
 pub fn psi(c: &std::path::Path, file: &str) -> Option<(f64, f64)> {
@@ -393,10 +433,13 @@ pub fn psi(c: &std::path::Path, file: &str) -> Option<(f64, f64)> {
     let mut full = 0.0;
     for line in s.lines() {
         let mut it = line.split_whitespace();
-        let kind = it.next()?;
-        let avg10 = it
+        let Some(kind) = it.next() else { continue };
+        let Some(avg10) = it
             .find_map(|kv| kv.strip_prefix("avg10="))
-            .and_then(|v| v.parse::<f64>().ok())?;
+            .and_then(|v| v.parse::<f64>().ok())
+        else {
+            continue;
+        };
         if kind == "some" {
             some = avg10;
         } else if kind == "full" {
@@ -410,7 +453,7 @@ pub fn total_ram_mib() -> (f64, f64) {
     let s = fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let get = |k: &str| {
         s.lines()
-            .find(|l| l.starts_with(k))
+            .find(|l| l.split_whitespace().next() == Some(k))
             .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
             .unwrap_or(0.0)
             / 1024.0
@@ -1052,5 +1095,23 @@ mod tests {
             None
         );
         assert_eq!(mesa_version_from_path("/opt/mesa-demos/bin/glxinfo"), None);
+    }
+
+    #[test]
+    fn psi_skips_malformed_lines_and_keeps_both_components() {
+        let dir = std::env::temp_dir().join(format!("wcb-psi-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cpu.pressure");
+        std::fs::write(
+            &file,
+            "some avg10=10.00 avg60=1.00 avg300=0.10 total=100\n\
+             \n\
+             malformed line\n\
+             full avg10=9.50 avg60=0.50 avg300=0.05 total=50\n\
+             full avg10=oops\n",
+        )
+        .unwrap();
+        assert_eq!(psi(&dir, "cpu.pressure"), Some((10.0, 9.5)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

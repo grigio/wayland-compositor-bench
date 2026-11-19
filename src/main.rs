@@ -315,6 +315,9 @@ struct SummaryUi {
     /// summary and the detailed numbers of the last run
     results_expander: gtk::Expander,
     results: gtk::Grid,
+    /// Save the displayed results as a shareable document.
+    export_html: gtk::Button,
+    export_markdown: gtk::Button,
 }
 
 impl SummaryUi {
@@ -383,6 +386,24 @@ impl SummaryUi {
         results_expander.set_margin_top(12);
         root.append(&results_expander);
 
+        // Export lives with the results, not in the header: it only makes
+        // sense once there is something to export.
+        let export_html = gtk::Button::with_label("HTML");
+        export_html.add_css_class("chip");
+        export_html.set_tooltip_text(Some("Save these results as an HTML report"));
+        let export_markdown = gtk::Button::with_label("Markdown");
+        export_markdown.add_css_class("chip");
+        export_markdown.set_tooltip_text(Some("Save these results as a Markdown table"));
+        let export_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        export_box.set_halign(gtk::Align::End);
+        export_box.set_margin_top(6);
+        let export_label = gtk::Label::new(Some("Export:"));
+        export_label.add_css_class("stat-sub");
+        export_box.append(&export_label);
+        export_box.append(&export_html);
+        export_box.append(&export_markdown);
+        root.append(&export_box);
+
         let feats = gtk::Grid::builder()
             .row_spacing(2)
             .column_spacing(12)
@@ -402,6 +423,8 @@ impl SummaryUi {
             feats,
             results_expander,
             results,
+            export_html,
+            export_markdown,
         }
     }
 
@@ -413,7 +436,7 @@ impl SummaryUi {
             render_known: s.render_known,
             stack_pss_mib: s.stack_mib,
             stack_cpu_pct: s.stack_cpu_pct,
-            known: s.comp_mib > 0.0,
+            known: s.comp_resolved,
             feat_pct: s.feat_pct,
         });
         self.chart.set(&s.cpu_series, &s.cpu_marks);
@@ -854,6 +877,15 @@ fn main() -> glib::ExitCode {
             }
         };
     }
+    if let Some(format) = &opts.export {
+        return match report::export(format, &opts.files) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("wayland-compositor-bench: {e}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
     if opts.check {
         return check(&opts);
     }
@@ -862,6 +894,15 @@ fn main() -> glib::ExitCode {
         .application_id("dev.bench.WaylandBench")
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
+
+    // The window is undecorated, so the mouse-only ✕ used to be the only way
+    // out. Give keyboard users the usual shortcuts as well.
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    let quit_app = app.clone();
+    quit.connect_activate(move |_, _| quit_app.quit());
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    app.set_accels_for_action("window.close", &["Escape"]);
 
     app.connect_startup(|_| {
         let provider = gtk::CssProvider::new();
@@ -888,6 +929,28 @@ fn main() -> glib::ExitCode {
     } else {
         code
     }
+}
+
+/// Logical size, fractional scale and refresh of a monitor, computed once so
+/// the benchmark client and the live "Scale"/"Physical mode" rows cannot
+/// disagree. GDK's integer scale is the fallback when the physical width is
+/// unknown: reporting 0× would be a lie in the UI and a wrong JSON field.
+fn monitor_geometry(m: &gtk::gdk::Monitor) -> ((u32, u32), f64, f64) {
+    let g = m.geometry();
+    let hz = m.refresh_rate() as f64 / 1000.0;
+    let hz = if hz > 0.0 { hz } else { 60.0 };
+    let (phys, _) = sysinfo::drm_mode().unwrap_or_default();
+    let phys_w: f64 = phys
+        .split('x')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let scale = if g.width() > 0 && phys_w > 0.0 {
+        phys_w / g.width() as f64
+    } else {
+        m.scale_factor() as f64
+    };
+    ((g.width() as u32, g.height() as u32), scale, hz)
 }
 
 fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) {
@@ -1190,37 +1253,15 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     let monitor = gtk::gdk::Display::default()
         .and_then(|d| d.monitors().item(0))
         .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok());
-    let refresh_hz = monitor
-        .as_ref()
-        .map(|m| {
-            let hz = m.refresh_rate() as f64 / 1000.0;
-            if hz > 0.0 {
-                hz
-            } else {
-                60.0
-            }
-        })
-        .unwrap_or(60.0);
-    let (logical, scale) = monitor
-        .as_ref()
-        .map(|m| {
-            let g = m.geometry();
-            let (phys, _) = sysinfo::drm_mode().unwrap_or_default();
-            let phys_w: f64 = phys
-                .split('x')
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
-            let frac = if g.width() > 0 && phys_w > 0.0 {
-                phys_w / g.width() as f64
-            } else {
-                m.scale_factor() as f64
-            };
-            ((g.width() as u32, g.height() as u32), frac)
-        })
-        .unwrap_or(((0, 0), 1.0));
+    let (logical, scale, refresh_hz) =
+        monitor
+            .as_ref()
+            .map(monitor_geometry)
+            .unwrap_or(((0, 0), 1.0, 60.0));
+    let edid_hz = sysinfo::first_output_refresh();
 
     let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let last_run: Rc<RefCell<Option<report::Run>>> = Rc::new(RefCell::new(None));
     let ui = bench::BenchUi {
         app: app.clone(),
         window: window.clone(),
@@ -1249,6 +1290,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
         blur_off: blur_off.clone(),
         failed: failed.clone(),
         scan: scan_cell.clone(),
+        last_run: last_run.clone(),
         opts: opts.clone(),
     };
     {
@@ -1259,6 +1301,59 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
                 bench::start(ui.clone());
             });
         }
+    }
+
+    // Export from the GUI: the run just displayed plus any saved runs, so it
+    // works even when the session was measured without --json.
+    {
+        let connect_export = |button: gtk::Button, format: &'static str, filename: &'static str| {
+            let w = window.clone();
+            let last = last_run.clone();
+            let files = opts.files.clone();
+            button.connect_clicked(move |_| {
+                let extra = last.borrow().clone();
+                let text = match report::export_text_with_run(format, &files, extra.as_ref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("wayland-compositor-bench: cannot export: {e}");
+                        return;
+                    }
+                };
+                let dialog = gtk::FileDialog::builder()
+                    .title("Export results")
+                    .initial_name(filename)
+                    .build();
+                dialog.save(
+                    Some(&w),
+                    None::<&gtk::gio::Cancellable>,
+                    move |result| match result {
+                        Ok(file) => {
+                            if let Some(path) = file.path() {
+                                if let Err(e) = std::fs::write(&path, &text) {
+                                    eprintln!(
+                                        "wayland-compositor-bench: cannot write {}: {e}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("wayland-compositor-bench: export cancelled: {e}");
+                        }
+                    },
+                );
+            });
+        };
+        connect_export(
+            summary_ui.export_html.clone(),
+            "html",
+            "wayland-compositor-bench.html",
+        );
+        connect_export(
+            summary_ui.export_markdown.clone(),
+            "markdown",
+            "wayland-compositor-bench.md",
+        );
     }
 
     // static hardware info
@@ -1352,6 +1447,7 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
     let monitor_c = monitor.clone();
     let comp_line_c = comp_line.clone();
     let perf_tip_c = perf_tip.clone();
+    let edid_hz_c = edid_hz;
     let update = move |labels: &Labels, monitor: &Option<gtk::gdk::Monitor>| {
         set(labels, "Wayland compositor", &compositor_line);
         if let Some(tip) = &comp_tip {
@@ -1368,23 +1464,12 @@ fn build_ui(app: &gtk::Application, opts: cli::Options, failed: Rc<Cell<bool>>) 
 
         if let Some(m) = monitor {
             let g = m.geometry();
-            let refresh = m.refresh_rate() as f64 / 1000.0;
+            let (_, frac, refresh) = monitor_geometry(m);
             let (phys, _) = sysinfo::drm_mode().unwrap_or(("unknown".into(), 0));
-            let phys_w: f64 = phys
-                .split('x')
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
-            let frac = if g.width() > 0 && phys_w > 0.0 {
-                phys_w / g.width() as f64
-            } else {
-                0.0
-            };
-            let phys_refresh = phys
-                .split('x')
-                .next_back()
-                .and_then(|s| s.parse::<u32>().ok())
-                .map(|h| format!(" @ {:.0} Hz", h))
+            // The second field of `drm_mode()` is the horizontal resolution,
+            // not a refresh rate. Only EDID has a trustworthy panel timing.
+            let phys_refresh = edid_hz_c
+                .map(|hz| format!(" @ {hz:.0} Hz"))
                 .unwrap_or_default();
             set(
                 labels,

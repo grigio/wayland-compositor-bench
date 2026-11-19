@@ -317,10 +317,12 @@ A sampler thread wakes every 25 ms and reads the cgroup's `memory.stat` and
 avoids the root-only `memory.peak` reset. CPU points are emitted at most every
 100 ms; the timeline is capped at 12,000 points (about 20 minutes).
 
-The average CPU across the run uses the trapezoid rule on those points, matching
-the fact that each sample describes the interval ending at its timestamp. The
-peak is kept separately. The timeline shows *when* the load happened, and phase
-marks delimit idle, single, windows and multi.
+The average CPU across the run weights each sample by the interval it measures:
+each point describes the span ending at its timestamp, so the first point (the
+reset window) is outside the run and later points carry their own dt. A
+trapezoid would halve the weight of the first and last reading and understate a
+spike at either end. The peak is kept separately. The timeline shows *when* the
+load happened, and phase marks delimit idle, single, windows and multi.
 
 ### Protocol scan and blur
 
@@ -437,8 +439,10 @@ defaults to the resolved desktop and is slugged to ASCII lowercase with dashes.
 
 `--report` and `--compare` accept directories, JSON files, or label substrings.
 With no arguments they search `./results` and the XDG results directory. Results
-are grouped by label; a filter matches a label substring first and falls back to
-a path substring. Only schema v3 files are read.
+are grouped by label; an exact label wins, then a label substring, and a filter
+that looks like a path matches the path. Only schema v3 files are read.
+`--compare` resolves exact labels first and refuses a selection that would put
+the same run on both sides.
 
 - **Medians, not means.** Each cell is the median of the runs with that label.
   When runs disagree by more than 1 %, the cell shows `[min-max]`; a single run
@@ -466,6 +470,12 @@ a path substring. Only schema v3 files are read.
 There is deliberately no single score. Any scalar over arbitrary weights
 (CPU, RAM, power, features) hides the trade-offs behind the number, so the
 tables expose the axes and the reader chooses what matters.
+
+`--export markdown|csv|html` renders the same medians as a shareable document
+on stdout. The GUI's HTML/Markdown buttons use the same renderer and add the run
+currently on screen, even without `--json`, because the `Run` is now built for
+every finished measurement and kept in `BenchUi::last_run`. Nothing is added to
+the JSON schema; the export is a view of the runs, not a new measurement.
 
 ## Window design
 

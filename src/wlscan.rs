@@ -9,11 +9,13 @@
 //! the same as `wp_presentation` turns the number into a vanity metric, and
 //! wlroots-only protocols are a design choice, not a missing feature.
 
+use std::sync::mpsc;
+
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::{
-    self, ExtBackgroundEffectManagerV1,
+    self, Capability, ExtBackgroundEffectManagerV1,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -43,6 +45,17 @@ impl BlurState {
             BlurState::Unsupported => "not supported",
             BlurState::Error => "unknown",
         }
+    }
+}
+
+/// The flags are a bitfield. A compositor may set a bit this client does not
+/// know yet (future protocol version): the parser delivers `WEnum::Unknown`
+/// with the raw bits in that case. Discarding it would report a probe failure
+/// even though blur is advertised.
+fn caps_bits(flags: WEnum<Capability>) -> u32 {
+    match flags {
+        WEnum::Value(caps) => caps.bits(),
+        WEnum::Unknown(raw) => raw,
     }
 }
 
@@ -88,11 +101,8 @@ impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Probe {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let ext_background_effect_manager_v1::Event::Capabilities {
-            flags: WEnum::Value(caps),
-        } = event
-        {
-            state.caps = Some(caps.bits());
+        if let ext_background_effect_manager_v1::Event::Capabilities { flags } = event {
+            state.caps = Some(caps_bits(flags));
         }
     }
 }
@@ -106,6 +116,18 @@ impl Dispatch<ExtBackgroundEffectManagerV1, ()> for Probe {
 /// `ext_background_effect_surface_v1` — GTK already owns one per toplevel and a
 /// second one is a protocol error that kills the connection.
 pub fn scan() -> Scan {
+    // The caller runs this on GTK's main loop. A compositor that binds the
+    // manager but never sends `capabilities` would block the roundtrip forever,
+    // so bound the wait and keep the detached worker from stalling the UI.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(scan_blocking());
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(1500))
+        .unwrap_or_default()
+}
+
+fn scan_blocking() -> Scan {
     let mut out = Scan::default();
     let Ok(conn) = Connection::connect_to_env() else {
         return out;
@@ -136,7 +158,7 @@ pub fn scan() -> Scan {
     // the capabilities event is sent when the global is bound
     out.blur = if queue.roundtrip(&mut probe).is_ok() {
         match probe.caps {
-            Some(caps) if caps & 1 != 0 => BlurState::Active,
+            Some(caps) if caps & Capability::Blur.bits() != 0 => BlurState::Active,
             Some(_) => BlurState::Unsupported,
             None => BlurState::Error,
         }
@@ -342,8 +364,20 @@ pub const FEATURES: &[Feature] = &[
         1,
     ),
     f(
+        "zwp_primary_selection_device_manager_v1",
+        "primary selection (legacy)",
+        Tier::Desktop,
+        1,
+    ),
+    f(
         "ext_data_control_manager_v1",
         "clipboard managers",
+        Tier::Desktop,
+        1,
+    ),
+    f(
+        "zwlr_data_control_manager_v1",
+        "clipboard managers (wlroots)",
         Tier::Desktop,
         1,
     ),
@@ -385,6 +419,12 @@ pub const FEATURES: &[Feature] = &[
         3,
     ),
     // capture & colour
+    f(
+        "wp_color_manager_v1",
+        "colour management / HDR",
+        Tier::Optional,
+        1,
+    ),
     f("zwlr_screencopy_manager_v1", "screencopy", Tier::Wlroots, 3),
     f(
         "ext_image_copy_capture_manager_v1",
@@ -570,5 +610,15 @@ mod tests {
         ]));
         assert_eq!(f.extra, 1);
         assert_eq!(f.supported, 1);
+    }
+
+    #[test]
+    fn blur_is_detected_even_when_the_bits_include_an_unknown_flag() {
+        // A future protocol version may add capability bits. wayland-client
+        // then yields WEnum::Unknown with the raw bitmask; the blur bit is
+        // still set and must be recognised.
+        let raw = caps_bits(WEnum::Unknown(Capability::Blur.bits() | 2));
+        assert_ne!(raw & Capability::Blur.bits(), 0);
+        assert_eq!(caps_bits(WEnum::Unknown(2)) & Capability::Blur.bits(), 0);
     }
 }

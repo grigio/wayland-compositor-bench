@@ -254,7 +254,7 @@ impl Radar {
             render,
             stack_ram,
             stack_cpu,
-            (v.feat_pct / 100.0).clamp(0.0, 1.0),
+            pacing_norm(v.feat_pct / 100.0),
         ]);
 
         {
@@ -306,6 +306,9 @@ impl Radar {
 }
 
 fn pacing_norm(share: f64) -> f64 {
+    if !share.is_finite() {
+        return 0.0;
+    }
     share.clamp(0.0, 1.0)
 }
 
@@ -331,6 +334,9 @@ fn render_cost_norm(cpu_pct_at_60hz: f64) -> f64 {
 }
 
 fn ram_norm(mib: f64, reference_mib: f64) -> f64 {
+    if !mib.is_finite() {
+        return 0.0;
+    }
     let reference = if reference_mib > 1.0 {
         reference_mib
     } else {
@@ -341,6 +347,9 @@ fn ram_norm(mib: f64, reference_mib: f64) -> f64 {
 }
 
 fn cpu_norm(pct: f64, capacity_pct: f64) -> f64 {
+    if !pct.is_finite() {
+        return 0.0;
+    }
     let capacity = if capacity_pct > 1.0 {
         capacity_pct
     } else {
@@ -772,6 +781,18 @@ mod tests {
         }
         for i in [0, 1, 5] {
             assert_eq!(BETTER[i], "↑", "axis {} ({})", i, TITLES[i]);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_value_never_plots_as_the_best_result() {
+        for norm in [
+            pacing_norm(f64::NAN),
+            render_cost_norm(f64::NAN),
+            ram_norm(f64::NAN, 8192.0),
+            cpu_norm(f64::NAN, 100.0),
+        ] {
+            assert_eq!(norm, 0.0);
         }
     }
 }

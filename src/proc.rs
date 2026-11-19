@@ -205,12 +205,17 @@ pub fn session_cpu_usec() -> u64 {
     session_cgroups().iter().map(|d| cpu_usage_usec(d)).sum()
 }
 
-/// Every process in the measured cgroups. The subtrees are disjoint, so the
-/// concatenation is the union.
+/// Every process in the measured cgroups. The subtrees can overlap (the login
+/// scope and the user manager may both contain a PID), so deduplicate.
 pub fn session_pids() -> Vec<u32> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for dir in session_cgroups() {
-        out.extend(pids_in_cgroup(dir));
+        for pid in pids_in_cgroup(dir) {
+            if seen.insert(pid) {
+                out.push(pid);
+            }
+        }
     }
     out
 }
@@ -612,12 +617,16 @@ pub struct CpuSnapshot {
 /// cgroup total. Used when the total comes from a different, tighter instant.
 pub fn cpu_procs() -> Vec<(u32, String, u64)> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for dir in session_cgroups() {
-        out.extend(pids_in_cgroup(dir).into_iter().filter_map(|pid| {
-            let ns = cpu_time_ns(pid)?;
+        for pid in pids_in_cgroup(dir) {
+            if !seen.insert(pid) {
+                continue;
+            }
+            let Some(ns) = cpu_time_ns(pid) else { continue };
             let name = comm(pid).unwrap_or_else(|| format!("pid {pid}"));
-            Some((pid, name, ns))
-        }));
+            out.push((pid, name, ns));
+        }
     }
     out
 }
@@ -1000,6 +1009,7 @@ fn socket_compositor() -> Option<Compositor> {
     let inode = socket_inode()?;
     let needle = format!("socket:[{inode}]");
     let rd = fs::read_dir("/proc").ok()?;
+    let mut candidates = Vec::new();
     for e in rd.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
@@ -1013,15 +1023,20 @@ fn socket_compositor() -> Option<Compositor> {
                 .map(|p| p.to_string_lossy() == needle.as_str())
                 == Some(true)
             {
-                return Some(Compositor {
+                candidates.push(Compositor {
                     pid,
                     name: comm(pid).unwrap_or_else(|| format!("pid {pid}")),
                     source: "socket",
                 });
+                break;
             }
         }
     }
-    None
+    // Several processes can hold a duplicate of the listening fd (a wrapper,
+    // a child, a socket-activated helper). `readdir` order is arbitrary, so
+    // prefer a process whose name is a known compositor, then the lowest PID.
+    candidates.sort_by_key(|c| (!KNOWN.contains(&c.name.as_str()), c.pid));
+    candidates.into_iter().next()
 }
 
 /// Fallback for compositors that hand out a display socket we cannot resolve:
@@ -1075,6 +1090,15 @@ fn compositor_version_uncached(name: &str) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // Drain stdout while the child runs: a binary that writes more than a pipe
+    // buffer before exiting would block on write and be killed as "hung".
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let ok = stdout.read_to_string(&mut text).is_ok();
+        let _ = tx.send(if ok { text } else { String::new() });
+    });
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
@@ -1087,8 +1111,11 @@ fn compositor_version_uncached(name: &str) -> Option<String> {
             }
         }
     }
-    let mut text = String::new();
-    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    // The child has exited, so the reader sees EOF unless a grandchild kept
+    // the pipe open; do not wait forever for that either.
+    let text = rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or_default();
     let line = text
         .lines()
         .next()
@@ -1129,6 +1156,11 @@ pub fn version_token(line: &str) -> Option<String> {
 /// blur and 1.75x scaling" do not end up in the same median.
 pub fn config_hash(name: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
+    let config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&home).join(".config"));
     let candidates: &[&str] = match name {
         "labwc" => &["labwc"],
         "Hyprland" | "hyprland" => &["hypr"],
@@ -1140,7 +1172,7 @@ pub fn config_hash(name: &str) -> Option<String> {
     };
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     for c in candidates {
-        let base = PathBuf::from(&home).join(".config").join(c);
+        let base = config.join(c);
         if base.is_dir() {
             collect_files(&base, 0, &mut entries);
         } else if base.is_file() {
@@ -1160,7 +1192,9 @@ pub fn config_hash(name: &str) -> Option<String> {
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     }
-    Some(format!("{:08x}", (h >> 32) as u32 ^ h as u32))
+    // Keep FNV (deterministic across Rust versions) but use all 64 bits: the
+    // old XOR-fold to 32 bits made collisions plausible between config variants.
+    Some(format!("{h:016x}"))
 }
 
 fn collect_files(dir: &Path, depth: u32, out: &mut Vec<(String, Vec<u8>)>) {

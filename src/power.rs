@@ -40,13 +40,18 @@ impl Default for Sample {
 }
 
 /// One reading of both RAPL domains. Cheap enough to call twice per phase.
+///
+/// The timestamp is taken *after* the reads: a `sudo -n cat` fork can take tens
+/// of milliseconds, and dividing by a window that ends before that work biases
+/// the reported watts high.
 pub fn sample() -> Sample {
-    let at = Instant::now();
     let (psys, pkg) = domains();
+    let psys = psys.as_ref().and_then(|d| d.read());
+    let pkg = pkg.as_ref().and_then(|d| d.read());
     Sample {
-        at,
-        psys: psys.as_ref().and_then(|d| d.read()),
-        pkg: pkg.as_ref().and_then(|d| d.read()),
+        at: Instant::now(),
+        psys,
+        pkg,
     }
 }
 
@@ -63,7 +68,9 @@ pub fn delta(a: Sample, b: Sample) -> (Option<f64>, Option<f64>) {
         let d = if b.uj >= a.uj {
             b.uj - a.uj
         } else {
-            b.max + b.uj - a.uj
+            // saturating: a corrupt `max` must not panic in debug builds or
+            // silently wrap into a plausible-looking watt value
+            b.max.saturating_sub(a.uj).saturating_add(b.uj)
         };
         Some(d as f64 / 1e6 / seconds)
     };
@@ -86,7 +93,7 @@ fn read_u64(path: &Path) -> Option<u64> {
     if let Ok(s) = fs::read_to_string(path) {
         return s.trim().parse().ok();
     }
-    if std::env::var_os("WG_BENCH_NO_SUDO").is_some() {
+    if crate::cli::env_flag("WG_BENCH_NO_SUDO") {
         return None;
     }
     // root-only: energy_uj, and the cgroup files the script used to touch
@@ -138,20 +145,33 @@ fn domains() -> &'static (Option<Domain>, Option<Domain>) {
     })
 }
 
-/// The first battery, with its status string.
+/// The battery to report, with its status string.
+///
+/// `readdir` order is arbitrary. Prefer `BAT0`, then a gauge that actually has
+/// `power_now`, then the lowest name, so two machines with different enumera-
+/// order do not report different batteries.
 pub fn battery() -> Option<(PathBuf, String)> {
-    let rd = fs::read_dir("/sys/class/power_supply").ok()?;
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("BAT") {
-            continue;
-        }
-        let status = fs::read_to_string(entry.path().join("status"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "unknown".into());
-        return Some((entry.path(), status));
-    }
-    None
+    let mut batteries: Vec<(String, PathBuf)> = fs::read_dir("/sys/class/power_supply")
+        .ok()?
+        .flatten()
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+        .filter(|(name, _)| name.starts_with("BAT"))
+        .collect();
+    batteries.sort_by(|a, b| {
+        let key = |item: &(String, PathBuf)| {
+            (
+                item.0 != "BAT0",
+                !item.1.join("power_now").exists(),
+                item.0.clone(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    let (_, dir) = batteries.into_iter().next()?;
+    let status = fs::read_to_string(dir.join("status"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    Some((dir, status))
 }
 
 /// Whether the two RAPL domains can be read at all, for `--check`.
@@ -225,5 +245,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(delta(a, b), (None, None));
+    }
+
+    #[test]
+    fn a_counter_wrap_uses_the_domain_width_without_overflowing() {
+        let t0 = Instant::now();
+        let max = 1_000_000;
+        let a = Sample {
+            psys: Some(reading(900_000, max)),
+            at: t0,
+            ..Default::default()
+        };
+        let b = Sample {
+            psys: Some(reading(100_000, max)),
+            at: t0 + Duration::from_secs(1),
+            ..Default::default()
+        };
+        // (max - 900k) + 100k = 200k uJ over 1 s = 0.2 W
+        assert_eq!(delta(a, b).0, Some(0.2));
+
+        // a corrupt width must saturate instead of panicking or wrapping
+        let bad = Sample {
+            psys: Some(reading(1, u64::MAX)),
+            at: t0 + Duration::from_secs(1),
+            ..Default::default()
+        };
+        assert!(delta(a, bad).0.is_some());
     }
 }
